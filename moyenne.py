@@ -1,15 +1,26 @@
+# moyenne.py — Portail Mega Formation (Sheets only + Planning structuré + Liens Drive manuels)
+# ✅ Sidebar = Connexion Employé (à gauche)
+# ✅ Centre = Espace Stagiaire
+# ✅ Planning = الموظف يكتب (jour + وقت + matière + prof + couleur) والمتكون يشوف tableau ملون
+# ✅ Paiements = حسب السنوات (2025/2026...) + أشهر Jan..Dec
+# ✅ Supports de cours = روابط Google Drive (manual paste) + المتكون يلقى الدروس ويحملها
+# ✅ Import Excel stagiaires (full_name + phone)
+# ✅ CRUD: الموظف ينجم يزيد/يعدّل/يفسخ (Planning + Supports + Stagiaires + Notes + Paiements)
+# ✅ بدون Drive API (تفادياً لمشاكل Service Account quota/permissions)
+# ✅ بدون st.link_button (باش ما يطيحش حسب نسخة Streamlit)
+
 import uuid
 import base64
 import io
-import time
 import re
-from datetime import datetime, date as dt_date
+from datetime import datetime, date as date_cls
 
+import streamlit.components.v1 as components
 import pandas as pd
 import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
-from gspread.exceptions import APIError, WorksheetNotFound
+from gspread.exceptions import APIError
 from PIL import Image
 
 # =========================================================
@@ -18,15 +29,18 @@ from PIL import Image
 st.set_page_config(page_title="Portail Mega Formation", page_icon="🧩", layout="wide")
 
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+DAYS_FR = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
+DAY_ORDER = {d: i for i, d in enumerate(DAYS_FR)}
 
 REQUIRED_SHEETS = {
     "Branches": ["branch", "staff_password", "is_active", "created_at"],
+
     "Programs": ["program_id", "branch", "program_name", "is_active", "created_at"],
     "Groups": ["group_id", "branch", "program_name", "group_name", "is_active", "created_at"],
 
     "Trainees": ["trainee_id", "full_name", "phone", "branch", "program", "group", "status", "created_at"],
 
+    # student_name = الاسم اللي كتبو المتكون في التسجيل
     "Accounts": ["phone", "password", "trainee_id", "student_name", "created_at", "last_login"],
 
     "Subjects": ["subject_id", "branch", "program", "group", "subject_name", "is_active", "created_at"],
@@ -34,37 +48,44 @@ REQUIRED_SHEETS = {
     "Grades": ["grade_id", "trainee_id", "branch", "program", "group",
                "subject_name", "exam_type", "score", "date", "staff_name", "note", "created_at"],
 
-    # Timetable typed by staff (CRUD + colors)
-    "Timetable": ["row_id", "branch", "program", "group", "year",
-                  "day", "start", "end", "subject", "room", "teacher", "color",
-                  "created_at", "updated_at", "staff_name"],
-
-    # Profile pics (small base64)
+    # صورة بروفيل (base64 صغير)
     "ProfilePics": ["phone", "trainee_id", "image_b64", "uploaded_at"],
 
-    # Payments
+    # دفوعات حسب السنة
     "Payments": ["payment_id", "trainee_id", "branch", "program", "group", "year"]
                 + MONTHS + ["updated_at", "staff_name"],
 
-    # Course supports links (Drive manual)
-    "CourseFiles": ["file_id", "branch", "program", "group", "subject_name", "file_name",
-                    "drive_view_url", "drive_download_url", "uploaded_at", "staff_name"],
+    # Supports de cours: روابط Drive فقط
+    "CourseLinks": ["link_id", "branch", "program", "group", "subject_name",
+                    "title", "drive_share_url", "drive_view_url", "drive_download_url",
+                    "uploaded_at", "staff_name"],
 
-    # Averages (editable)
-    "Averages": ["avg_id", "trainee_id", "branch", "program", "group", "year",
-                 "semester", "average", "note", "created_at", "updated_at", "staff_name"],
+    # Planning: الموظف يكتب الحصص + لون
+    "Timetable": ["row_id", "branch", "program", "group", "year",
+                  "day", "start", "end",
+                  "subject_name", "teacher", "room",
+                  "color", "note",
+                  "updated_at", "staff_name"],
 }
 
 # =========================================================
 # UTILS
 # =========================================================
-HEX_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
-
-def norm(x):
+def norm(x) -> str:
     return str(x or "").strip()
 
-def now_str():
+def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def today_year_str() -> str:
+    return str(datetime.now().year)
+
+def df_filter(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+    out = df.copy()
+    for k, v in kwargs.items():
+        if k in out.columns:
+            out = out[out[k].astype(str).str.strip() == norm(v)]
+    return out
 
 def explain_api_error(e: APIError) -> str:
     try:
@@ -72,47 +93,14 @@ def explain_api_error(e: APIError) -> str:
         text = getattr(e.response, "text", "") or ""
         low = text.lower()
         if status == 429 or "quota" in low or "rate" in low:
-            return "⚠️ 429 Quota (Google Sheets). جرّب Reboot واستنى شوية.\n" + text[:240]
+            return "⚠️ 429 Quota (Google Sheets). جرّب Reboot واستنى شوية.\n" + text[:300]
         if status == 403 or "permission" in low or "forbidden" in low:
-            return "❌ 403 Permission. Share Sheet مع service account.\n" + text[:240]
+            return "❌ 403 Permission. لازم Share للـ Google Sheet للـ service account (client_email) كـ Editor.\n" + text[:300]
         if status == 404 or "not found" in low:
-            return "❌ 404 Not found. تأكد GSHEET_ID صحيح + Share للـ service account.\n" + text[:240]
-        return "❌ Google API Error:\n" + (text[:360] if text else str(e))
+            return "❌ 404 Not found. تأكد GSHEET_ID صحيح + Share للـ service account.\n" + text[:300]
+        return "❌ Google API Error:\n" + (text[:500] if text else str(e))
     except Exception:
         return "❌ Google API Error."
-
-def ensure_cols(df: pd.DataFrame, ws_name: str) -> pd.DataFrame:
-    expected = REQUIRED_SHEETS.get(ws_name, [])
-    if df is None:
-        return pd.DataFrame(columns=expected)
-    df2 = df.copy()
-    for c in expected:
-        if c not in df2.columns:
-            df2[c] = ""
-    # keep expected order first
-    cols = expected + [c for c in df2.columns if c not in expected]
-    return df2[cols]
-
-def df_filter(df: pd.DataFrame, **kwargs):
-    if df is None or df.empty:
-        return pd.DataFrame(columns=df.columns if df is not None else [])
-    out = df.copy()
-    for k, v in kwargs.items():
-        if k in out.columns:
-            out = out[out[k].astype(str).str.strip() == norm(v)]
-    return out
-
-def safe_float(x, default=0.0):
-    try:
-        return float(str(x).replace(",", "."))
-    except Exception:
-        return default
-
-def valid_hex_color(c: str, fallback="#E8EEF7"):
-    c = norm(c)
-    if HEX_RE.match(c):
-        return c
-    return fallback
 
 def compress_image_bytes(img_bytes: bytes, max_side: int = 256, quality: int = 70) -> bytes:
     im = Image.open(io.BytesIO(img_bytes))
@@ -130,8 +118,8 @@ def compress_image_bytes(img_bytes: bytes, max_side: int = 256, quality: int = 7
     im.save(out, format="JPEG", quality=quality, optimize=True)
     return out.getvalue()
 
-# --- Drive link helpers (manual) ---
-def extract_drive_file_id(url: str):
+# ---- Drive link helpers (manual links) ----
+def extract_drive_file_id(url: str) -> str | None:
     u = norm(url)
     if not u:
         return None
@@ -150,39 +138,34 @@ def extract_drive_file_id(url: str):
             return u.split("uc?id=")[1].split("&")[0]
         except Exception:
             return None
+    m = re.search(r"/d/([a-zA-Z0-9_-]{10,})", u)
+    if m:
+        return m.group(1)
     return None
 
-def to_view_and_download(url: str):
-    fid = extract_drive_file_id(url)
+def to_view_and_download(share_url: str) -> tuple[str, str]:
+    fid = extract_drive_file_id(share_url)
     if not fid:
-        return norm(url), norm(url)
+        return norm(share_url), norm(share_url)
     view_url = f"https://drive.google.com/file/d/{fid}/view"
     dl_url = f"https://drive.google.com/uc?export=download&id={fid}"
     return view_url, dl_url
 
-def link_btn(label: str, url: str, key: str):
+def safe_url_md(label: str, url: str) -> str:
     u = norm(url)
     if not u:
-        st.button(label, disabled=True, use_container_width=True, key=key)
-        return
-    # Streamlit versions differ. If link_button exists, use it; otherwise show a clickable markdown link.
-    if hasattr(st, "link_button"):
-        try:
-            st.link_button(label, u, use_container_width=True, key=key)
-            return
-        except Exception:
-            pass
-    st.markdown(f"- **{label}**: {u}")
+        return ""
+    return f"[{label}]({u})"
 
 # =========================================================
-# AUTH CLIENTS
+# GOOGLE CLIENTS
 # =========================================================
 @st.cache_resource
 def creds():
     creds_dict = st.secrets["gcp_service_account"]
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/drive",  # ok even if only links
     ]
     return Credentials.from_service_account_info(creds_dict, scopes=scopes)
 
@@ -195,115 +178,104 @@ def spreadsheet():
     return gs_client().open_by_key(st.secrets["GSHEET_ID"])
 
 # =========================================================
-# SHEETS (AUTO CREATE + RETRIES)
+# SCHEMA (SAFE, NO CLEAR)
 # =========================================================
-def ensure_headers_safe(ws, headers):
-    try:
-        rng = ws.get("1:1")
-    except Exception:
-        rng = []
+def ensure_headers_safe(ws, headers: list[str]):
+    rng = ws.get("1:1")
     row1 = rng[0] if (rng and len(rng) > 0) else []
     row1 = [norm(x) for x in row1]
+
     if len(row1) == 0 or all(x == "" for x in row1):
         ws.append_row(headers, value_input_option="RAW")
         return
+
     if row1 != headers:
-        st.warning(f"⚠️ Sheet '{ws.title}' headers مختلفة. ما عملتش مسح. صحّح الهيدرز يدويًا إذا تحب.")
+        st.warning(f"⚠️ Sheet '{ws.title}' headers مختلفة. ما عملتش مسح. إذا تحب صحّح الهيدرز يدويًا.")
 
-def get_ws(ws_name: str):
+def ensure_worksheets_and_headers():
     sh = spreadsheet()
-    try:
+    titles = [w.title for w in sh.worksheets()]
+    for ws_name, headers in REQUIRED_SHEETS.items():
+        if ws_name not in titles:
+            sh.add_worksheet(title=ws_name, rows=4000, cols=max(16, len(headers) + 2))
+            titles.append(ws_name)
         ws = sh.worksheet(ws_name)
-        ensure_headers_safe(ws, REQUIRED_SHEETS[ws_name])
-        return ws
-    except WorksheetNotFound:
-        ws = sh.add_worksheet(title=ws_name, rows=4000, cols=max(20, len(REQUIRED_SHEETS[ws_name]) + 2))
-        ensure_headers_safe(ws, REQUIRED_SHEETS[ws_name])
-        return ws
-
-def ensure_all_sheets():
-    for name in REQUIRED_SHEETS.keys():
-        _ = get_ws(name)
+        ensure_headers_safe(ws, headers)
 
 def ensure_schema_once():
+    # manual only to reduce 429
     if st.session_state.get("schema_ok", False):
         return
+    if not st.session_state.get("init_schema_now", False):
+        return
     try:
-        ensure_all_sheets()
+        ensure_worksheets_and_headers()
         st.session_state.schema_ok = True
+        st.session_state.init_schema_now = False
+        st.success("✅ Sheets vérifiées / initialisées (sans suppression).")
     except APIError as e:
+        st.session_state.init_schema_now = False
         st.error(explain_api_error(e))
+        raise
 
-def _sheet_read_retry(ws, max_tries=4):
-    last_err = None
-    for i in range(max_tries):
-        try:
-            return ws.get_all_values()
-        except APIError as e:
-            last_err = e
-            msg = str(e).lower()
-            if "quota" in msg or "429" in msg or "rate" in msg:
-                time.sleep(1.2 * (i + 1))
-                continue
-            raise
-    if last_err:
-        raise last_err
-    return ws.get_all_values()
-
-@st.cache_data(ttl=180, show_spinner=False)
+# =========================================================
+# SHEETS CRUD (CACHED READ)
+# =========================================================
+@st.cache_data(ttl=300, show_spinner=False)
 def read_df(ws_name: str) -> pd.DataFrame:
-    ws = get_ws(ws_name)
-    values = _sheet_read_retry(ws)
+    ws = spreadsheet().worksheet(ws_name)
+    values = ws.get_all_values()
     if len(values) <= 1:
         return pd.DataFrame(columns=REQUIRED_SHEETS[ws_name])
     headers = values[0]
     rows = values[1:]
     df = pd.DataFrame(rows, columns=headers)
-    return ensure_cols(df, ws_name)
+
+    # ensure required columns exist (avoid KeyError)
+    for c in REQUIRED_SHEETS[ws_name]:
+        if c not in df.columns:
+            df[c] = ""
+    return df
 
 def append_row(ws_name: str, row: dict):
-    ws = get_ws(ws_name)
+    ws = spreadsheet().worksheet(ws_name)
     headers = REQUIRED_SHEETS[ws_name]
     out = [norm(row.get(h, "")) for h in headers]
     ws.append_row(out, value_input_option="USER_ENTERED")
     st.cache_data.clear()
 
-def update_row_by_key(ws_name: str, key_cols, key_vals, updates: dict) -> bool:
-    df = ensure_cols(read_df(ws_name), ws_name)
+def find_first_rownum_by_key(ws_name: str, key_cols: list[str], key_vals: list[str]) -> int | None:
+    df = read_df(ws_name)
     if df.empty:
-        return False
-
+        return None
     m = df.copy()
     for c, v in zip(key_cols, key_vals):
         if c not in m.columns:
-            return False
+            return None
         m = m[m[c].astype(str).str.strip() == norm(v)]
     if m.empty:
+        return None
+    idx = int(m.index[0])
+    return idx + 2  # sheet row number (1 header)
+
+def update_row_by_key(ws_name: str, key_cols: list[str], key_vals: list[str], updates: dict) -> bool:
+    row_num = find_first_rownum_by_key(ws_name, key_cols, key_vals)
+    if row_num is None:
         return False
-
-    idx = m.index[0]
-    row_num = idx + 2
-    ws = get_ws(ws_name)
+    ws = spreadsheet().worksheet(ws_name)
     headers = REQUIRED_SHEETS[ws_name]
-
     for col_name, val in updates.items():
         if col_name not in headers:
             continue
         ws.update_cell(row_num, headers.index(col_name) + 1, norm(val))
-
     st.cache_data.clear()
     return True
 
-def delete_row_by_key(ws_name: str, key_col: str, key_val: str) -> bool:
-    df = ensure_cols(read_df(ws_name), ws_name)
-    if df.empty or key_col not in df.columns:
+def delete_row_by_key(ws_name: str, key_cols: list[str], key_vals: list[str]) -> bool:
+    row_num = find_first_rownum_by_key(ws_name, key_cols, key_vals)
+    if row_num is None:
         return False
-    m = df[df[key_col].astype(str).str.strip() == norm(key_val)]
-    if m.empty:
-        return False
-    idx = m.index[0]
-    row_num = idx + 2
-    ws = get_ws(ws_name)
+    ws = spreadsheet().worksheet(ws_name)
     ws.delete_rows(row_num)
     st.cache_data.clear()
     return True
@@ -311,17 +283,11 @@ def delete_row_by_key(ws_name: str, key_col: str, key_val: str) -> bool:
 # =========================================================
 # PROFILE PICS
 # =========================================================
-def get_profile_pic_bytes(phone: str):
-    phone = norm(phone)
-    if not phone:
-        return None
-    try:
-        df = ensure_cols(read_df("ProfilePics"), "ProfilePics")
-    except APIError:
-        return None
+def get_profile_pic_bytes(phone: str) -> bytes | None:
+    df = read_df("ProfilePics")
     if df.empty:
         return None
-    m = df[df["phone"].astype(str).str.strip() == phone]
+    m = df[df["phone"].astype(str).str.strip() == norm(phone)]
     if m.empty:
         return None
     b64 = norm(m.iloc[0].get("image_b64"))
@@ -352,7 +318,7 @@ def upsert_profile_pic(phone: str, trainee_id: str, img_bytes: bytes):
 # PAYMENTS
 # =========================================================
 def ensure_payment_row(trainee_id: str, branch: str, program: str, group: str, year: str, staff_name: str):
-    df = ensure_cols(read_df("Payments"), "Payments")
+    df = read_df("Payments")
     if not df.empty:
         m = df[(df["trainee_id"].astype(str).str.strip() == norm(trainee_id)) &
                (df["year"].astype(str).str.strip() == norm(year))]
@@ -374,114 +340,162 @@ def ensure_payment_row(trainee_id: str, branch: str, program: str, group: str, y
     append_row("Payments", row)
 
 def set_payment_month(trainee_id: str, year: str, month: str, paid: bool, staff_name: str) -> bool:
-    df = ensure_cols(read_df("Payments"), "Payments")
+    df = read_df("Payments")
     if df.empty:
         return False
     m = df[(df["trainee_id"].astype(str).str.strip() == norm(trainee_id)) &
            (df["year"].astype(str).str.strip() == norm(year))]
     if m.empty:
         return False
-
-    idx = m.index[0]
+    idx = int(m.index[0])
     row_num = idx + 2
-    ws = get_ws("Payments")
+    ws = spreadsheet().worksheet("Payments")
     headers = REQUIRED_SHEETS["Payments"]
-
     ws.update_cell(row_num, headers.index(month) + 1, "TRUE" if paid else "FALSE")
     ws.update_cell(row_num, headers.index("updated_at") + 1, now_str())
     ws.update_cell(row_num, headers.index("staff_name") + 1, staff_name)
-
     st.cache_data.clear()
     return True
 
+def list_payment_years(trainee_id: str) -> list[str]:
+    df = read_df("Payments")
+    if df.empty:
+        return []
+    m = df[df["trainee_id"].astype(str).str.strip() == norm(trainee_id)]
+    years = sorted({norm(y) for y in m["year"].astype(str).tolist() if norm(y)})
+    return years
+
 # =========================================================
-# TIMETABLE (CRUD + HTML GRID)
+# TIMETABLE (PLANNING)
 # =========================================================
 def load_timetable(branch: str, program: str, group: str, year: str) -> pd.DataFrame:
-    df = ensure_cols(read_df("Timetable"), "Timetable")
+    df = read_df("Timetable")
     if df.empty:
         return df
-    for c in ["branch", "program", "group", "year", "day", "start", "end"]:
-        df[c] = df[c].astype(str).str.strip()
-    return df[(df["branch"] == norm(branch)) &
-              (df["program"] == norm(program)) &
-              (df["group"] == norm(group)) &
-              (df["year"] == norm(year))].copy()
-
-def timetable_html_grid(df: pd.DataFrame) -> str:
-    df = ensure_cols(df, "Timetable")
-    if df.empty:
-        return "<div style='padding:10px'>Aucun planning.</div>"
-
     df2 = df.copy()
-    for c in ["day", "start", "end", "subject", "teacher", "room", "color"]:
-        df2[c] = df2[c].astype(str).str.strip()
 
-    day_map = {d: i for i, d in enumerate(DAYS)}
-    df2["day_i"] = df2["day"].map(lambda x: day_map.get(x, 99))
+    # ensure columns exist
+    for c in REQUIRED_SHEETS["Timetable"]:
+        if c not in df2.columns:
+            df2[c] = ""
 
-    # Sort safely
-    df2 = df2.sort_values(by=["day_i", "start", "end"], ascending=True)
+    m = (
+        (df2["branch"].astype(str).str.strip() == norm(branch)) &
+        (df2["program"].astype(str).str.strip() == norm(program)) &
+        (df2["group"].astype(str).str.strip() == norm(group)) &
+        (df2["year"].astype(str).str.strip() == norm(year))
+    )
+    df2 = df2[m].copy()
 
-    th = "".join([f"<th style='padding:10px;border:1px solid #ddd;background:#fafafa'>{d}</th>" for d in DAYS])
-    tds = []
-    for d in DAYS:
-        items = df2[df2["day"] == d].copy()
-        if items.empty:
-            tds.append("<td style='vertical-align:top;padding:10px;border:1px solid #ddd;min-width:180px'>—</td>")
+    # ordering
+    df2["day_i"] = df2["day"].astype(str).map(lambda d: DAY_ORDER.get(norm(d), 99))
+    df2["start_sort"] = df2["start"].astype(str)
+    df2["end_sort"] = df2["end"].astype(str)
+    df2 = df2.sort_values(by=["day_i", "start_sort", "end_sort"], ascending=True)
+    return df2
+
+def add_timetable_row(branch: str, program: str, group: str, year: str,
+                      day: str, start: str, end: str,
+                      subject_name: str, teacher: str, room: str,
+                      color: str, note: str, staff_name: str):
+    append_row("Timetable", {
+        "row_id": f"TT-{uuid.uuid4().hex[:10].upper()}",
+        "branch": branch,
+        "program": program,
+        "group": group,
+        "year": year,
+        "day": day,
+        "start": start,
+        "end": end,
+        "subject_name": subject_name,
+        "teacher": teacher,
+        "room": room,
+        "color": color,
+        "note": note,
+        "updated_at": now_str(),
+        "staff_name": staff_name,
+    })
+
+def update_timetable_row(row_id: str, updates: dict) -> bool:
+    updates = dict(updates)
+    updates["updated_at"] = now_str()
+    return update_row_by_key("Timetable", ["row_id"], [row_id], updates)
+
+def delete_timetable_row(row_id: str) -> bool:
+    return delete_row_by_key("Timetable", ["row_id"], [row_id])
+
+def timetable_grid_html(df: pd.DataFrame) -> str:
+    # Build a simple HTML table with colored cells
+    # Columns: Days rows; time slots per day (stacked)
+    if df is None or df.empty:
+        return "<div style='padding:10px;border:1px dashed #999;border-radius:10px'>Aucun créneau enregistré.</div>"
+
+    # group by day
+    by_day = {d: [] for d in DAYS_FR}
+    for _, r in df.iterrows():
+        day = norm(r.get("day"))
+        if day not in by_day:
             continue
+        by_day[day].append(r.to_dict())
 
-        blocks = []
-        for _, r in items.iterrows():
-            c = valid_hex_color(r.get("color"), "#E8EEF7")
-            start = norm(r.get("start"))
-            end = norm(r.get("end"))
-            subj = norm(r.get("subject"))
-            teach = norm(r.get("teacher"))
-            room = norm(r.get("room"))
+    # Build table
+    html = """
+    <style>
+      .tt-wrap{width:100%; overflow-x:auto;}
+      table.tt{border-collapse:separate;border-spacing:10px;width:100%;}
+      table.tt th{font-size:14px;text-align:left;padding:6px 8px;}
+      table.tt td{vertical-align:top;}
+      .slot{
+        border-radius:14px;
+        padding:10px 12px;
+        border:1px solid rgba(0,0,0,0.08);
+        box-shadow:0 1px 2px rgba(0,0,0,0.06);
+        margin-bottom:10px;
+      }
+      .slot .time{font-weight:700;}
+      .slot .sub{font-weight:700;margin-top:6px;}
+      .slot .meta{opacity:0.85;font-size:12px;margin-top:4px;}
+    </style>
+    <div class="tt-wrap">
+    <table class="tt">
+      <thead><tr>
+    """
+    for d in DAYS_FR:
+        html += f"<th>{d}</th>"
+    html += "</tr></thead><tbody><tr>"
 
-            blocks.append(
-                f"""
-                <div style="background:{c};padding:10px;border-radius:12px;margin-bottom:10px;border:1px solid rgba(0,0,0,0.08)">
-                  <div style="font-weight:800">{start} → {end}</div>
-                  <div style="margin-top:6px"><b>{subj}</b></div>
-                  <div style="opacity:0.88;margin-top:4px">{teach}</div>
-                  <div style="opacity:0.75;margin-top:2px">{room}</div>
+    for d in DAYS_FR:
+        html += "<td>"
+        slots = by_day.get(d, [])
+        if not slots:
+            html += "<div style='opacity:0.6'>—</div>"
+        else:
+            for s in slots:
+                color = norm(s.get("color")) or "#E8EEF7"
+                stt = norm(s.get("start"))
+                enn = norm(s.get("end"))
+                sub = norm(s.get("subject_name"))
+                teacher = norm(s.get("teacher"))
+                room = norm(s.get("room"))
+                note = norm(s.get("note"))
+                meta = " | ".join([x for x in [teacher, room] if x])
+                html += f"""
+                <div class="slot" style="background:{color}">
+                  <div class="time">{stt} → {enn}</div>
+                  <div class="sub">{sub}</div>
+                  <div class="meta">{meta}</div>
+                  {"<div class='meta'>"+note+"</div>" if note else ""}
                 </div>
                 """
-            )
-        tds.append(f"<td style='vertical-align:top;padding:10px;border:1px solid #ddd;min-width:180px'>{''.join(blocks)}</td>")
-
-    return f"""
-    <div style="overflow:auto">
-    <table style="border-collapse:collapse;width:100%;min-width:1100px">
-      <thead><tr>{th}</tr></thead>
-      <tbody><tr>{''.join(tds)}</tr></tbody>
-    </table>
-    </div>
-    """
-
-# =========================================================
-# AVERAGES
-# =========================================================
-def load_averages(branch: str, program: str, group: str, trainee_id: str = None) -> pd.DataFrame:
-    df = ensure_cols(read_df("Averages"), "Averages")
-    if df.empty:
-        return df
-    for c in ["branch", "program", "group", "trainee_id", "year", "semester"]:
-        df[c] = df[c].astype(str).str.strip()
-    out = df[(df["branch"] == norm(branch)) &
-             (df["program"] == norm(program)) &
-             (df["group"] == norm(group))].copy()
-    if trainee_id:
-        out = out[out["trainee_id"] == norm(trainee_id)].copy()
-    return out
+        html += "</td>"
+    html += "</tr></tbody></table></div>"
+    return html
 
 # =========================================================
 # AUTH / SESSION
 # =========================================================
 def ensure_session():
-    st.session_state.setdefault("role", None)
+    st.session_state.setdefault("role", None)   # "staff" or None
     st.session_state.setdefault("user", {})
     st.session_state.setdefault("student", None)
 
@@ -490,24 +504,33 @@ def logout_staff():
     st.session_state.user = {}
 
 def staff_branch_login(branch: str, branch_password: str):
-    df = ensure_cols(read_df("Branches"), "Branches")
+    df = read_df("Branches")
     if df.empty:
         return None
     df2 = df.copy()
+    for c in ["branch", "staff_password", "is_active"]:
+        if c not in df2.columns:
+            df2[c] = ""
     df2["branch"] = df2["branch"].astype(str).str.strip()
     df2["staff_password"] = df2["staff_password"].astype(str).str.strip()
     df2["is_active"] = df2["is_active"].astype(str).str.strip().str.lower()
-    m = df2[(df2["branch"] == norm(branch)) &
-            (df2["staff_password"] == norm(branch_password)) &
-            (df2["is_active"] != "false")]
+
+    m = df2[
+        (df2["branch"] == norm(branch)) &
+        (df2["staff_password"] == norm(branch_password)) &
+        (df2["is_active"] != "false")
+    ]
     if m.empty:
         return None
     return {"branch": norm(branch), "role": "staff"}
 
 def student_login(phone: str, password: str):
-    df = ensure_cols(read_df("Accounts"), "Accounts")
+    df = read_df("Accounts")
     if df.empty:
         return None
+    for c in ["phone", "password"]:
+        if c not in df.columns:
+            df[c] = ""
     df2 = df.copy()
     df2["phone"] = df2["phone"].astype(str).str.strip()
     df2["password"] = df2["password"].astype(str).str.strip()
@@ -517,13 +540,15 @@ def student_login(phone: str, password: str):
     return m.iloc[0].to_dict()
 
 # =========================================================
-# SIDEBAR STAFF LOGIN
+# SIDEBAR STAFF LOGIN (LEFT)
 # =========================================================
 def sidebar_staff_login():
     st.sidebar.markdown("## 👨‍💼 Connexion Employé")
 
-    branches_df = ensure_cols(read_df("Branches"), "Branches")
-    branches = sorted([x for x in branches_df["branch"].astype(str).str.strip().unique().tolist() if x]) if not branches_df.empty else []
+    branches_df = read_df("Branches")
+    branches = []
+    if not branches_df.empty and "branch" in branches_df.columns:
+        branches = sorted([x for x in branches_df["branch"].astype(str).str.strip().unique().tolist() if x])
 
     if st.session_state.role == "staff":
         br = norm(st.session_state.user.get("branch"))
@@ -531,26 +556,23 @@ def sidebar_staff_login():
 
         st.sidebar.divider()
         st.sidebar.markdown("### 🧰 Maintenance")
-        if st.sidebar.button("Initialiser / Vérifier les Sheets", use_container_width=True, key="btn_init_schema"):
-            try:
-                ensure_all_sheets()
-                st.sidebar.success("✅ OK")
-            except APIError as e:
-                st.sidebar.error(explain_api_error(e))
+        if st.sidebar.button("Initialiser / Vérifier les Sheets", use_container_width=True, key="sb_init"):
+            st.session_state.init_schema_now = True
+            st.rerun()
 
-        if st.sidebar.button("Se déconnecter", use_container_width=True, key="btn_logout_staff"):
+        if st.sidebar.button("Se déconnecter", use_container_width=True, key="sb_logout"):
             logout_staff()
             st.rerun()
         return
 
     if not branches:
-        st.sidebar.warning("Branches vide. Ajoutez centres + mots de passe.")
+        st.sidebar.warning("Branches vide. Ajoutez centres + mots de passe (Sheet: Branches).")
         return
 
     branch = st.sidebar.selectbox("Centre", branches, key="sb_branch")
     pwd = st.sidebar.text_input("Mot de passe du centre", type="password", key="sb_pwd")
 
-    if st.sidebar.button("Connexion", use_container_width=True, key="btn_login_staff"):
+    if st.sidebar.button("Connexion", use_container_width=True, key="sb_login"):
         user = staff_branch_login(branch, pwd)
         if user:
             st.session_state.role = "staff"
@@ -561,18 +583,18 @@ def sidebar_staff_login():
             st.sidebar.error("Mot de passe incorrect / centre inactif.")
 
 # =========================================================
-# STUDENT PORTAL
+# STUDENT PORTAL (CENTER)
 # =========================================================
 def student_portal_center():
     st.markdown("## 🎓 Espace Stagiaire")
+
     tab1, tab2, tab3 = st.tabs(["🔐 Connexion", "🆕 Inscription", "📌 Mon espace"])
 
-    # --------- Login
+    # ------------------ Login
     with tab1:
         phone = st.text_input("Téléphone", key="stud_phone")
         pwd = st.text_input("Mot de passe", type="password", key="stud_pwd")
-
-        if st.button("Se connecter", use_container_width=True, key="btn_stud_login"):
+        if st.button("Se connecter", use_container_width=True, key="stud_login_btn"):
             acc = student_login(phone, pwd)
             if acc:
                 update_row_by_key("Accounts", ["phone"], [phone], {"last_login": now_str()})
@@ -581,34 +603,35 @@ def student_portal_center():
                 st.rerun()
             else:
                 st.error("Téléphone / mot de passe incorrect.")
-
-        if st.button("Se déconnecter (Stagiaire)", use_container_width=True, key="btn_stud_logout"):
+        if st.button("Se déconnecter", use_container_width=True, key="stud_logout_btn"):
             st.session_state.student = None
             st.rerun()
 
-    # --------- Register
+    # ------------------ Registration
     with tab2:
         st.subheader("Inscription (Nom libre + Téléphone لازم يكون مسجّل عند الإدارة)")
 
-        branches_df = ensure_cols(read_df("Branches"), "Branches")
-        branches = sorted([x for x in branches_df["branch"].astype(str).str.strip().unique().tolist() if x]) if not branches_df.empty else []
+        branches_df = read_df("Branches")
+        branches = sorted([x for x in branches_df.get("branch", pd.Series([], dtype=str)).astype(str).str.strip().unique().tolist() if x]) if not branches_df.empty else []
         if not branches:
-            st.warning("Aucun centre.")
+            st.warning("Aucun centre disponible.")
             return
 
         b = st.selectbox("Centre", branches, key="reg_branch")
 
-        prog_df = df_filter(ensure_cols(read_df("Programs"), "Programs"), branch=b)
-        prog_df = prog_df[prog_df["is_active"].astype(str).str.strip().str.lower() != "false"].copy()
-        programs = sorted([x for x in prog_df["program_name"].astype(str).str.strip().tolist() if x])
+        prog_df = df_filter(read_df("Programs"), branch=b)
+        if not prog_df.empty and "is_active" in prog_df.columns:
+            prog_df = prog_df[prog_df["is_active"].astype(str).str.strip().str.lower() != "false"].copy()
+        programs = sorted([x for x in prog_df.get("program_name", pd.Series([], dtype=str)).astype(str).str.strip().tolist() if x])
         if not programs:
-            st.warning("Aucune spécialité.")
+            st.warning("Aucune spécialité pour ce centre.")
             return
         p = st.selectbox("Spécialité", programs, key="reg_prog")
 
-        grp_df = df_filter(ensure_cols(read_df("Groups"), "Groups"), branch=b, program_name=p)
-        grp_df = grp_df[grp_df["is_active"].astype(str).str.strip().str.lower() != "false"].copy()
-        groups = sorted([x for x in grp_df["group_name"].astype(str).str.strip().tolist() if x])
+        grp_df = df_filter(read_df("Groups"), branch=b, program_name=p)
+        if not grp_df.empty and "is_active" in grp_df.columns:
+            grp_df = grp_df[grp_df["is_active"].astype(str).str.strip().str.lower() != "false"].copy()
+        groups = sorted([x for x in grp_df.get("group_name", pd.Series([], dtype=str)).astype(str).str.strip().tolist() if x])
         if not groups:
             st.warning("Aucun groupe.")
             return
@@ -618,60 +641,68 @@ def student_portal_center():
         phone = st.text_input("Téléphone (نفس رقمك عند الإدارة)", key="reg_phone")
         pwd = st.text_input("Mot de passe", type="password", key="reg_pwd")
 
-        if st.button("Créer mon compte", use_container_width=True, key="btn_register"):
+        if st.button("Créer mon compte", use_container_width=True, key="reg_btn"):
             if not norm(student_name) or not norm(phone) or not norm(pwd):
-                st.error("Nom + téléphone + mot de passe obligatoire.")
+                st.error("Nom + téléphone + mot de passe obligatoires.")
                 return
             if len(norm(pwd)) < 4:
                 st.error("Mot de passe قصير (min 4).")
                 return
 
-            acc = ensure_cols(read_df("Accounts"), "Accounts")
-            if not acc.empty and acc["phone"].astype(str).str.strip().eq(norm(phone)).any():
+            acc = read_df("Accounts")
+            if not acc.empty and "phone" in acc.columns and acc["phone"].astype(str).str.strip().eq(norm(phone)).any():
                 st.error("Ce téléphone est déjà inscrit.")
                 return
 
-            tr = ensure_cols(read_df("Trainees"), "Trainees")
+            tr = read_df("Trainees")
             if tr.empty:
-                st.error("Aucun stagiaire.")
+                st.error("Aucun stagiaire enregistré.")
                 return
+
+            for c in ["branch", "program", "group", "phone", "trainee_id"]:
+                if c not in tr.columns:
+                    tr[c] = ""
 
             tr2 = tr.copy()
             for c in ["branch", "program", "group", "phone"]:
                 tr2[c] = tr2[c].astype(str).str.strip()
 
-            candidates = tr2[(tr2["branch"] == norm(b)) &
-                             (tr2["program"] == norm(p)) &
-                             (tr2["group"] == norm(g)) &
-                             (tr2["phone"] == norm(phone))]
+            # ✅ match by phone ONLY (with same centre/program/group)
+            candidates = tr2[
+                (tr2["branch"] == norm(b)) &
+                (tr2["program"] == norm(p)) &
+                (tr2["group"] == norm(g)) &
+                (tr2["phone"] == norm(phone))
+            ]
             if candidates.empty:
-                st.error("رقم الهاتف موش موجود في Trainees. الموظف لازم يسجل نفس الرقم.")
+                st.error("رقم الهاتف موش موجود في Trainees لنفس centre/spécialité/groupe. الموظف لازم يسجل نفس الرقم.")
                 return
 
-            trainee_id = candidates.iloc[0]["trainee_id"]
-
+            trainee_id = norm(candidates.iloc[0]["trainee_id"])
             append_row("Accounts", {
                 "phone": norm(phone),
                 "password": norm(pwd),
-                "trainee_id": norm(trainee_id),
+                "trainee_id": trainee_id,
                 "student_name": norm(student_name),
                 "created_at": now_str(),
-                "last_login": "",
+                "last_login": ""
             })
-            st.success("✅ Compte créé. امشي Connexion.")
+            st.success("✅ Compte créé. امشي لصفحة Connexion.")
 
-    # --------- My Space
+    # ------------------ My Space
     with tab3:
         acc = st.session_state.get("student")
         if not acc:
-            st.info("اعمل Connexion.")
+            st.info("اعمل Connexion باش تشوف النوطات والدفوعات والجدول والدروس.")
             return
 
         trainee_id = norm(acc.get("trainee_id"))
         phone = norm(acc.get("phone"))
         student_name = norm(acc.get("student_name"))
 
-        tr = ensure_cols(read_df("Trainees"), "Trainees")
+        tr = read_df("Trainees")
+        if "trainee_id" not in tr.columns:
+            tr["trainee_id"] = ""
         row = tr[tr["trainee_id"].astype(str).str.strip() == trainee_id].copy() if not tr.empty else pd.DataFrame()
         if row.empty:
             st.error("Compte مرتبط بمتربص غير موجود.")
@@ -681,23 +712,28 @@ def student_portal_center():
         branch = norm(info.get("branch"))
         program = norm(info.get("program"))
         group = norm(info.get("group"))
+        full_name_admin = norm(info.get("full_name"))
 
         c1, c2 = st.columns([1, 3])
         with c1:
-            pic = get_profile_pic_bytes(phone)
+            try:
+                pic = get_profile_pic_bytes(phone)
+            except APIError as e:
+                st.error(explain_api_error(e))
+                pic = None
             if pic:
-                st.image(pic, caption="Photo", use_container_width=True)
+                st.image(pic, caption="Photo de profil", use_container_width=True)
             else:
                 st.info("Pas de photo")
 
         with c2:
-            st.success(f"Bienvenue {student_name or norm(info.get('full_name'))} ✅")
+            st.success(f"Bienvenue {student_name or full_name_admin} ✅")
             st.caption(f"Centre: {branch} | Spécialité: {program} | Groupe: {group} | Tél: {phone}")
 
             up = st.file_uploader("📸 Ajouter/Changer ma photo (PNG/JPG)", type=["png", "jpg", "jpeg"], key="pp_upl")
             if up is not None:
                 img_bytes = up.read()
-                st.image(img_bytes, caption="Aperçu", width=150)
+                st.image(img_bytes, caption="Aperçu", width=160)
                 if st.button("Enregistrer ma photo", use_container_width=True, key="pp_save"):
                     try:
                         upsert_profile_pic(phone, trainee_id, img_bytes)
@@ -706,168 +742,271 @@ def student_portal_center():
                     except APIError as e:
                         st.error(explain_api_error(e))
 
-        t1, t2, t3, t4, t5 = st.tabs(["📝 Notes", "🗓️ Planning", "💳 Paiements", "📎 Supports", "📊 Moyennes"])
+        t1, t2, t3, t4 = st.tabs(["📝 Notes", "🗓️ Emploi du temps", "💳 Paiements", "📎 Supports"])
 
         with t1:
-            gr = ensure_cols(read_df("Grades"), "Grades")
+            gr = read_df("Grades")
+            if "trainee_id" not in gr.columns:
+                gr["trainee_id"] = ""
             grf = gr[gr["trainee_id"].astype(str).str.strip() == trainee_id].copy() if not gr.empty else pd.DataFrame()
             if grf.empty:
-                st.info("Aucune note.")
+                st.info("Aucune note pour le moment.")
             else:
+                # safe sort
+                for c in ["date", "created_at"]:
+                    if c not in grf.columns:
+                        grf[c] = ""
                 grf = grf.sort_values(by=["date", "created_at"], ascending=False)
-                st.dataframe(grf[["subject_name", "exam_type", "score", "date", "staff_name", "note"]],
-                             use_container_width=True, hide_index=True)
+                cols_show = [c for c in ["subject_name", "exam_type", "score", "date", "staff_name", "note"] if c in grf.columns]
+                st.dataframe(grf[cols_show], use_container_width=True, hide_index=True)
 
         with t2:
-            year_now = str(datetime.now().year)
-            year_sel = st.selectbox("Année", [str(datetime.now().year - 1), str(datetime.now().year), str(datetime.now().year + 1)],
-                                    index=1, key="stud_tt_year")
-            tt = load_timetable(branch, program, group, year_sel)
-            st.markdown(timetable_html_grid(tt), unsafe_allow_html=True)
+            y_default = today_year_str()
+            # allow student to choose year for timetable
+            tt_all = read_df("Timetable")
+            if tt_all.empty:
+                st.info("Aucun planning enregistré.")
+            else:
+                # list years for this group
+                for c in ["branch", "program", "group", "year"]:
+                    if c not in tt_all.columns:
+                        tt_all[c] = ""
+                years = sorted({norm(x) for x in tt_all[
+                    (tt_all["branch"].astype(str).str.strip() == branch) &
+                    (tt_all["program"].astype(str).str.strip() == program) &
+                    (tt_all["group"].astype(str).str.strip() == group)
+                ]["year"].astype(str).tolist() if norm(x)})
+                if not years:
+                    years = [y_default]
+                year_pick = st.selectbox("Année", years, index=years.index(y_default) if y_default in years else 0, key="stud_tt_year")
+                tt = load_timetable(branch, program, group, year_pick)
+                components.html(timetable_grid_html(tt), height=520, scrolling=True)
 
         with t3:
-            pay = ensure_cols(read_df("Payments"), "Payments")
-            years = []
-            if not pay.empty:
-                years = sorted([y for y in pay[pay["trainee_id"].astype(str).str.strip() == trainee_id]["year"]
-                               .astype(str).str.strip().unique().tolist() if y])
+            years = list_payment_years(trainee_id)
             if not years:
                 st.info("لا توجد بيانات دفوعات.")
             else:
-                year_pick = st.selectbox("Année", years, key="stud_pay_year")
-                m = pay[(pay["trainee_id"].astype(str).str.strip() == trainee_id) &
-                        (pay["year"].astype(str).str.strip() == norm(year_pick))].copy()
+                y0 = today_year_str()
+                year_pick = st.selectbox("Année", years, index=years.index(y0) if y0 in years else 0, key="stud_pay_year")
+                pay = read_df("Payments")
+                for c in ["trainee_id", "year"]:
+                    if c not in pay.columns:
+                        pay[c] = ""
+                m = pay[
+                    (pay["trainee_id"].astype(str).str.strip() == trainee_id) &
+                    (pay["year"].astype(str).str.strip() == norm(year_pick))
+                ] if not pay.empty else pd.DataFrame()
                 if m.empty:
-                    st.info("لا توجد بيانات لهذه السنة.")
+                    st.info("لا توجد بيانات دفوعات لهذه السنة.")
                 else:
                     rowp = m.iloc[0].to_dict()
-                    show = {mo: ("✅" if (norm(rowp.get(mo)).upper() == "TRUE") else "❌") for mo in MONTHS}
+                    show = {mo: (norm(rowp.get(mo)).upper() == "TRUE") for mo in MONTHS}
                     st.dataframe(pd.DataFrame([show]), use_container_width=True, hide_index=True)
 
         with t4:
-            files = ensure_cols(read_df("CourseFiles"), "CourseFiles")
-            files = files[(files["branch"].astype(str).str.strip() == branch) &
-                          (files["program"].astype(str).str.strip() == program) &
-                          (files["group"].astype(str).str.strip() == group)] if not files.empty else pd.DataFrame()
+            files = read_df("CourseLinks")
             if files.empty:
-                st.info("لا توجد ملفات.")
+                st.info("لا توجد دروس.")
             else:
-                files = files.sort_values(by=["uploaded_at"], ascending=False)
-                for _, r in files.iterrows():
-                    fid = norm(r.get("file_id")) or uuid.uuid4().hex
-                    st.markdown(f"**📌 {norm(r.get('subject_name'))}** — {norm(r.get('file_name'))}")
-                    link_btn("👀 Ouvrir", norm(r.get("drive_view_url")), key=f"stud_v_{fid}")
-                    link_btn("⬇️ Télécharger", norm(r.get("drive_download_url")), key=f"stud_d_{fid}")
-                    st.divider()
+                for c in ["branch", "program", "group"]:
+                    if c not in files.columns:
+                        files[c] = ""
+                files = files[
+                    (files["branch"].astype(str).str.strip() == branch) &
+                    (files["program"].astype(str).str.strip() == program) &
+                    (files["group"].astype(str).str.strip() == group)
+                ].copy()
+                if files.empty:
+                    st.info("لا توجد دروس لهذه المجموعة.")
+                else:
+                    for c in ["uploaded_at"]:
+                        if c not in files.columns:
+                            files[c] = ""
+                    files = files.sort_values(by=["uploaded_at"], ascending=False)
+                    for _, r in files.iterrows():
+                        title = norm(r.get("title")) or norm(r.get("file_name")) or "Support"
+                        subj = norm(r.get("subject_name"))
+                        view_url = norm(r.get("drive_view_url"))
+                        dl_url = norm(r.get("drive_download_url"))
+                        share = norm(r.get("drive_share_url"))
 
-        with t5:
-            av = ensure_cols(read_df("Averages"), "Averages")
-            av = av[av["trainee_id"].astype(str).str.strip() == trainee_id].copy() if not av.empty else pd.DataFrame()
-            if av.empty:
-                st.info("لا توجد Moyennes.")
-            else:
-                av["year"] = av["year"].astype(str).str.strip()
-                av["semester"] = av["semester"].astype(str).str.strip()
-                av = av.sort_values(by=["year", "semester"], ascending=False)
-                show = av[["year", "semester", "average", "note", "updated_at", "staff_name"]].copy()
-                st.dataframe(show, use_container_width=True, hide_index=True)
+                        st.markdown(f"### 📌 {subj}")
+                        st.markdown(f"**{title}**")
+                        links = []
+                        if view_url:
+                            links.append(safe_url_md("👀 Ouvrir", view_url))
+                        elif share:
+                            links.append(safe_url_md("👀 Ouvrir", share))
+                        if dl_url:
+                            links.append(safe_url_md("⬇️ Télécharger", dl_url))
+                        if links:
+                            st.markdown(" | ".join(links))
+                        st.caption(f"Ajouté le: {norm(r.get('uploaded_at'))} — {norm(r.get('staff_name'))}")
+                        st.divider()
 
 # =========================================================
-# STAFF AREA (FULL)
+# STAFF WORK AREA (CENTER)
 # =========================================================
 def staff_work_center():
-    st.markdown("## 🛠️ Espace Employé")
+    st.markdown("## 🛠️ Espace Employé (Gestion)")
+
     if st.session_state.role != "staff":
-        st.info("Connexion Employé من اليسار.")
+        st.info("Connexion Employé من اليسار باش تفتح الإدارة.")
         return
 
     staff_branch = norm(st.session_state.user.get("branch"))
     staff_name = f"Staff-{staff_branch}"
+    st.success(f"Centre: {staff_branch}")
 
-    # Load once to reduce quota
-    programs_df = ensure_cols(read_df("Programs"), "Programs")
-    groups_df = ensure_cols(read_df("Groups"), "Groups")
-    trainees_df = ensure_cols(read_df("Trainees"), "Trainees")
-    subjects_df = ensure_cols(read_df("Subjects"), "Subjects")
-
-    prog_df = df_filter(programs_df, branch=staff_branch)
-    prog_df = prog_df[prog_df["is_active"].astype(str).str.strip().str.lower() != "false"].copy()
-    programs = sorted([x for x in prog_df["program_name"].astype(str).str.strip().tolist() if x])
+    # programs/groups
+    prog_df = df_filter(read_df("Programs"), branch=staff_branch)
+    if not prog_df.empty and "is_active" in prog_df.columns:
+        prog_df = prog_df[prog_df["is_active"].astype(str).str.strip().str.lower() != "false"].copy()
+    programs = sorted([x for x in prog_df.get("program_name", pd.Series([], dtype=str)).astype(str).str.strip().tolist() if x])
 
     colA, colB, colC = st.columns([2, 2, 1])
     with colA:
-        program = st.selectbox("Spécialité", programs, key="manage_program") if programs else None
+        program = st.selectbox("Spécialité", programs, key="mg_program") if programs else None
     with colB:
         group = None
-        groups = []
         if program:
-            grp_df = df_filter(groups_df, branch=staff_branch, program_name=program)
-            grp_df = grp_df[grp_df["is_active"].astype(str).str.strip().str.lower() != "false"].copy()
-            groups = sorted([x for x in grp_df["group_name"].astype(str).str.strip().tolist() if x])
-            group = st.selectbox("Groupe", groups, key="manage_group") if groups else None
+            grp_df = df_filter(read_df("Groups"), branch=staff_branch, program_name=program)
+            if not grp_df.empty and "is_active" in grp_df.columns:
+                grp_df = grp_df[grp_df["is_active"].astype(str).str.strip().str.lower() != "false"].copy()
+            groups = sorted([x for x in grp_df.get("group_name", pd.Series([], dtype=str)).astype(str).str.strip().tolist() if x])
+            group = st.selectbox("Groupe", groups, key="mg_group") if groups else None
     with colC:
-        year = st.selectbox(
-            "Année",
-            [str(datetime.now().year - 1), str(datetime.now().year), str(datetime.now().year + 1)],
-            index=1,
-            key="pay_year",
-        )
+        year = st.selectbox("Année", [today_year_str(), str(int(today_year_str()) + 1), str(int(today_year_str()) - 1)], key="mg_year")
 
-    tab_stag, tab_gr, tab_pay, tab_tt, tab_sup, tab_avg = st.tabs(
-        ["👤 Stagiaires", "📝 Notes (CRUD)", "💳 Paiements", "🗓️ Planning (CRUD)", "📎 Supports (Liens Drive)", "📊 Moyennes (CRUD)"]
-    )
+    tabs = st.tabs([
+        "🏷️ Spécialités", "👥 Groupes", "📚 Matières",
+        "👤 Stagiaires", "📝 Notes", "💳 Paiements",
+        "🗓️ Planning", "📎 Supports"
+    ])
 
-    # ------------------ Stagiaires
-    with tab_stag:
-        if not (program and group):
-            st.info("اختار spécialité + groupe.")
+    # -------- Programs
+    with tabs[0]:
+        cur = df_filter(read_df("Programs"), branch=staff_branch)
+        show = cur[["program_name", "is_active", "created_at"]] if (not cur.empty and "program_name" in cur.columns) else cur
+        st.dataframe(show, use_container_width=True, hide_index=True)
+
+        new_prog = st.text_input("Nouvelle spécialité", key="new_prog")
+        if st.button("Ajouter spécialité", use_container_width=True, key="add_prog_btn"):
+            if not norm(new_prog):
+                st.error("Nom obligatoire.")
+            else:
+                append_row("Programs", {
+                    "program_id": f"PR-{uuid.uuid4().hex[:8].upper()}",
+                    "branch": staff_branch,
+                    "program_name": norm(new_prog),
+                    "is_active": "true",
+                    "created_at": now_str()
+                })
+                st.success("✅ Ajouté.")
+                st.rerun()
+
+    # -------- Groups
+    with tabs[1]:
+        if not program:
+            st.info("اختار Spécialité من فوق.")
         else:
-            cur = trainees_df.copy()
-            for c in ["branch", "program", "group", "phone", "full_name"]:
-                cur[c] = cur[c].astype(str).str.strip()
-            cur = cur[(cur["branch"] == staff_branch) & (cur["program"] == norm(program)) & (cur["group"] == norm(group))].copy()
+            cur = df_filter(read_df("Groups"), branch=staff_branch, program_name=program)
+            show = cur[["group_name", "is_active", "created_at"]] if (not cur.empty and "group_name" in cur.columns) else cur
+            st.dataframe(show, use_container_width=True, hide_index=True)
 
-            st.dataframe(cur[["full_name", "phone", "status", "created_at"]] if not cur.empty else cur,
-                         use_container_width=True, hide_index=True)
-
-            st.markdown("### ➕ Ajouter stagiaire")
-            name = st.text_input("Nom", key="add_tr_name")
-            phone = st.text_input("Téléphone", key="add_tr_phone")
-            status = st.selectbox("Statut", ["active", "inactive"], key="add_tr_status")
-            if st.button("Enregistrer", use_container_width=True, key="btn_add_tr"):
-                if not norm(name) or not norm(phone):
-                    st.error("Nom + téléphone obligatoire.")
+            new_group = st.text_input("Nouveau groupe", key="new_group")
+            if st.button("Ajouter groupe", use_container_width=True, key="add_group_btn"):
+                if not norm(new_group):
+                    st.error("Nom obligatoire.")
                 else:
-                    # prevent duplicate phone in same group/program/branch
-                    if not cur.empty and cur["phone"].astype(str).str.strip().eq(norm(phone)).any():
-                        st.error("❌ نفس رقم الهاتف موجود مسبقًا في نفس المجموعة.")
-                    else:
-                        append_row("Trainees", {
-                            "trainee_id": f"TR-{uuid.uuid4().hex[:8].upper()}",
-                            "full_name": norm(name),
-                            "phone": norm(phone),
-                            "branch": staff_branch,
-                            "program": norm(program),
-                            "group": norm(group),
-                            "status": status,
-                            "created_at": now_str(),
-                        })
-                        st.success("✅ Ajouté.")
-                        st.rerun()
+                    append_row("Groups", {
+                        "group_id": f"GP-{uuid.uuid4().hex[:8].upper()}",
+                        "branch": staff_branch,
+                        "program_name": norm(program),
+                        "group_name": norm(new_group),
+                        "is_active": "true",
+                        "created_at": now_str()
+                    })
+                    st.success("✅ Ajouté.")
+                    st.rerun()
+
+    # -------- Subjects
+    with tabs[2]:
+        if not (program and group):
+            st.info("اختار Spécialité + Groupe.")
+        else:
+            cur = df_filter(read_df("Subjects"), branch=staff_branch, program=program, group=group)
+            show = cur[["subject_name", "is_active", "created_at"]] if (not cur.empty and "subject_name" in cur.columns) else cur
+            st.dataframe(show, use_container_width=True, hide_index=True)
+
+            subject_name = st.text_input("Nouvelle matière", key="new_subj")
+            if st.button("Ajouter matière", use_container_width=True, key="add_subj_btn"):
+                if not norm(subject_name):
+                    st.error("Nom obligatoire.")
+                else:
+                    append_row("Subjects", {
+                        "subject_id": f"SB-{uuid.uuid4().hex[:8].upper()}",
+                        "branch": staff_branch,
+                        "program": norm(program),
+                        "group": norm(group),
+                        "subject_name": norm(subject_name),
+                        "is_active": "true",
+                        "created_at": now_str()
+                    })
+                    st.success("✅ Ajouté.")
+                    st.rerun()
+
+    # -------- Trainees
+    with tabs[3]:
+        if not (program and group):
+            st.info("اختار Spécialité + Groupe.")
+        else:
+            cur = df_filter(read_df("Trainees"), branch=staff_branch, program=program, group=group)
+            show_cols = [c for c in ["full_name", "phone", "status", "created_at"] if c in cur.columns]
+            st.dataframe(cur[show_cols] if not cur.empty else cur, use_container_width=True, hide_index=True)
+
+            st.markdown("### ➕ Ajouter un stagiaire")
+            name = st.text_input("Nom & Prénom", key="tr_name")
+            phone = st.text_input("Téléphone (obligatoire pour inscription)", key="tr_phone")
+            status = st.selectbox("Statut", ["active", "inactive"], key="tr_status")
+            if st.button("Enregistrer stagiaire", use_container_width=True, key="tr_add_btn"):
+                if not norm(name) or not norm(phone):
+                    st.error("Nom + téléphone obligatoires.")
+                else:
+                    # avoid duplicate phone in same group
+                    existing = df_filter(read_df("Trainees"), branch=staff_branch, program=program, group=group)
+                    if not existing.empty and "phone" in existing.columns:
+                        if existing["phone"].astype(str).str.strip().eq(norm(phone)).any():
+                            st.error("Téléphone déjà موجود في نفس groupe.")
+                            return
+                    append_row("Trainees", {
+                        "trainee_id": f"TR-{uuid.uuid4().hex[:8].upper()}",
+                        "full_name": norm(name),
+                        "phone": norm(phone),
+                        "branch": staff_branch,
+                        "program": norm(program),
+                        "group": norm(group),
+                        "status": status,
+                        "created_at": now_str()
+                    })
+                    st.success("✅ Ajouté.")
+                    st.rerun()
 
             st.divider()
-            st.markdown("### 📥 Import Excel (xlsx) : full_name + phone")
-            up = st.file_uploader("Uploader Excel", type=["xlsx"], key="excel_tr")
+            st.markdown("### 📥 Import Excel (xlsx) : colonnes = full_name + phone")
+            up = st.file_uploader("Uploader Excel", type=["xlsx"], key="tr_excel")
             if up is not None:
                 df = pd.read_excel(up)
-                df.columns = [c.strip() for c in df.columns]
+                df.columns = [str(c).strip() for c in df.columns]
                 st.dataframe(df.head(20), use_container_width=True)
 
-                if st.button("✅ Importer maintenant", use_container_width=True, key="do_imp"):
+                if st.button("✅ Importer maintenant", use_container_width=True, key="tr_do_import"):
                     if "full_name" not in df.columns or "phone" not in df.columns:
-                        st.error("لازم full_name و phone.")
+                        st.error("لازم colonnes: full_name و phone")
                     else:
-                        existing_phones = set(cur["phone"].astype(str).str.strip().tolist()) if not cur.empty else set()
+                        existing = df_filter(read_df("Trainees"), branch=staff_branch, program=program, group=group)
+                        existing_phones = set(existing.get("phone", pd.Series([], dtype=str)).astype(str).str.strip().tolist()) if not existing.empty else set()
                         count = 0
                         for _, r in df.iterrows():
                             fn = norm(r.get("full_name"))
@@ -891,41 +1030,37 @@ def staff_work_center():
                         st.success(f"✅ Import terminé: {count}")
                         st.rerun()
 
-    # ------------------ Notes CRUD
-    with tab_gr:
+    # -------- Grades
+    with tabs[4]:
         if not (program and group):
-            st.info("اختار spécialité + groupe.")
+            st.info("اختار Spécialité + Groupe.")
         else:
-            tr = trainees_df.copy()
-            for c in ["branch", "program", "group", "phone", "full_name", "trainee_id"]:
-                tr[c] = tr[c].astype(str).str.strip()
-            tr = tr[(tr["branch"] == staff_branch) & (tr["program"] == norm(program)) & (tr["group"] == norm(group))].copy()
-
-            sub = subjects_df.copy()
-            for c in ["branch", "program", "group", "subject_name", "is_active"]:
-                sub[c] = sub[c].astype(str).str.strip()
-            sub = sub[(sub["branch"] == staff_branch) & (sub["program"] == norm(program)) & (sub["group"] == norm(group))].copy()
-            sub = sub[sub["is_active"].astype(str).str.lower() != "false"].copy()
+            tr = df_filter(read_df("Trainees"), branch=staff_branch, program=program, group=group)
+            sub = df_filter(read_df("Subjects"), branch=staff_branch, program=program, group=group)
+            if not sub.empty and "is_active" in sub.columns:
+                sub = sub[sub["is_active"].astype(str).str.strip().str.lower() != "false"].copy()
 
             if tr.empty:
                 st.warning("لا يوجد stagiaires.")
             elif sub.empty:
-                st.warning("زيد matières قبل (Sheet Subjects).")
+                st.warning("زيد matières قبل.")
             else:
-                tr["label"] = tr["full_name"] + " — " + tr["phone"] + " — " + tr["trainee_id"]
-                chosen = st.selectbox("Stagiaire", tr["label"].tolist(), key="gr_trainee")
-                trainee_id = tr[tr["label"] == chosen].iloc[0]["trainee_id"]
+                tr = tr.copy()
+                for c in ["full_name", "phone", "trainee_id"]:
+                    if c not in tr.columns:
+                        tr[c] = ""
+                tr["label"] = tr["full_name"].astype(str) + " — " + tr["phone"].astype(str) + " — " + tr["trainee_id"].astype(str)
+                chosen = st.selectbox("Stagiaire", tr["label"].tolist(), key="gr_tr_sel")
+                trainee_id = norm(tr[tr["label"] == chosen].iloc[0]["trainee_id"])
 
-                subjects = sorted([x for x in sub["subject_name"].astype(str).str.strip().tolist() if x])
+                subjects = sorted([x for x in sub.get("subject_name", pd.Series([], dtype=str)).astype(str).str.strip().tolist() if x])
+                subject_name = st.selectbox("Matière", subjects, key="gr_sub_sel")
+                exam_type = st.text_input("Type examen (DS1/TP/Examen...)", key="gr_exam")
+                score = st.number_input("Note", min_value=0.0, max_value=20.0, value=10.0, step=0.25, key="gr_score")
+                d = st.date_input("Date", value=datetime.now().date(), key="gr_date")
+                note = st.text_area("Remarque", key="gr_note")
 
-                st.markdown("### ➕ Ajouter note")
-                subject_name = st.selectbox("Matière", subjects, key="gr_subject_add")
-                exam_type = st.text_input("Type examen (DS1/TP/Examen...)", key="gr_examtype_add")
-                score = st.number_input("Note", min_value=0.0, max_value=20.0, value=10.0, step=0.25, key="gr_score_add")
-                d = st.date_input("Date", value=datetime.now().date(), key="gr_date_add")
-                note_txt = st.text_area("Remarque", key="gr_note_add")
-
-                if st.button("✅ Enregistrer la note", use_container_width=True, key="btn_save_grade"):
+                if st.button("✅ Enregistrer la note", use_container_width=True, key="gr_save_btn"):
                     if not norm(exam_type):
                         st.error("Type examen obligatoire.")
                     else:
@@ -940,392 +1075,238 @@ def staff_work_center():
                             "score": str(score),
                             "date": str(d),
                             "staff_name": staff_name,
-                            "note": norm(note_txt),
+                            "note": norm(note),
                             "created_at": now_str(),
                         })
                         st.success("✅ Note enregistrée.")
                         st.rerun()
 
-                st.divider()
-                st.markdown("### ✏️/🗑️ Modifier أو حذف ملاحظات")
-                grades = ensure_cols(read_df("Grades"), "Grades")
-                grades = grades[grades["trainee_id"].astype(str).str.strip() == norm(trainee_id)].copy() if not grades.empty else pd.DataFrame()
-                if grades.empty:
-                    st.info("لا توجد Notes لهذا المتكون.")
-                else:
-                    grades["date"] = grades["date"].astype(str).str.strip()
-                    grades["created_at"] = grades["created_at"].astype(str).str.strip()
-                    grades = grades.sort_values(by=["date", "created_at"], ascending=False)
-
-                    grades["label"] = (
-                        grades["date"].astype(str) + " | " +
-                        grades["subject_name"].astype(str) + " | " +
-                        grades["exam_type"].astype(str) + " | " +
-                        grades["score"].astype(str) + " | " +
-                        grades["grade_id"].astype(str)
-                    )
-                    pick = st.selectbox("Choisir note", grades["label"].tolist(), key="gr_pick_edit")
-                    row = grades[grades["label"] == pick].iloc[0].to_dict()
-
-                    gid = norm(row.get("grade_id"))
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        s_e = st.selectbox("Matière", subjects, index=max(0, subjects.index(norm(row.get("subject_name"))) if norm(row.get("subject_name")) in subjects else 0),
-                                           key="gr_subject_edit")
-                        t_e = st.text_input("Type examen", value=norm(row.get("exam_type")), key="gr_examtype_edit")
-                        sc_e = st.number_input("Note", min_value=0.0, max_value=20.0, value=float(safe_float(row.get("score"), 0.0)),
-                                               step=0.25, key="gr_score_edit")
-                    with c2:
-                        # parse date safe
-                        try:
-                            dd = datetime.fromisoformat(norm(row.get("date"))).date()
-                        except Exception:
-                            dd = datetime.now().date()
-                        d_e = st.date_input("Date", value=dd, key="gr_date_edit")
-                        n_e = st.text_area("Remarque", value=norm(row.get("note")), key="gr_note_edit")
-
-                    b1, b2 = st.columns(2)
-                    with b1:
-                        if st.button("💾 Sauvegarder modification", use_container_width=True, key="gr_save_edit"):
-                            ok = update_row_by_key(
-                                "Grades",
-                                ["grade_id"], [gid],
-                                {
-                                    "subject_name": norm(s_e),
-                                    "exam_type": norm(t_e),
-                                    "score": str(sc_e),
-                                    "date": str(d_e),
-                                    "note": norm(n_e),
-                                    "staff_name": staff_name,
-                                }
-                            )
-                            if ok:
-                                st.success("✅ تم التعديل")
-                                st.rerun()
-                            else:
-                                st.error("❌ ما لقايناش السطر باش نعدلو")
-                    with b2:
-                        if st.button("🗑️ Supprimer note", use_container_width=True, key="gr_del"):
-                            if delete_row_by_key("Grades", "grade_id", gid):
-                                st.success("✅ تحذفت")
-                                st.rerun()
-                            else:
-                                st.error("❌ ما تحذفتش")
-
-    # ------------------ Payments
-    with tab_pay:
+    # -------- Payments
+    with tabs[5]:
         if not (program and group):
-            st.info("اختار spécialité + groupe.")
+            st.info("اختار Spécialité + Groupe.")
         else:
-            tr = trainees_df.copy()
-            for c in ["branch", "program", "group", "phone", "full_name", "trainee_id"]:
-                tr[c] = tr[c].astype(str).str.strip()
-            tr = tr[(tr["branch"] == staff_branch) & (tr["program"] == norm(program)) & (tr["group"] == norm(group))].copy()
-
+            tr = df_filter(read_df("Trainees"), branch=staff_branch, program=program, group=group)
             if tr.empty:
                 st.info("لا يوجد stagiaires.")
             else:
-                tr["label"] = tr["full_name"] + " — " + tr["phone"] + " — " + tr["trainee_id"]
-                chosen = st.selectbox("Choisir stagiaire", tr["label"].tolist(), key="pay_trainee")
-                trainee_id = tr[tr["label"] == chosen].iloc[0]["trainee_id"]
+                tr = tr.copy()
+                for c in ["full_name", "phone", "trainee_id"]:
+                    if c not in tr.columns:
+                        tr[c] = ""
+                tr["label"] = tr["full_name"].astype(str) + " — " + tr["phone"].astype(str) + " — " + tr["trainee_id"].astype(str)
+                chosen = st.selectbox("Choisir stagiaire", tr["label"].tolist(), key="pay_tr_sel")
+                trainee_id = norm(tr[tr["label"] == chosen].iloc[0]["trainee_id"])
 
-                ensure_payment_row(trainee_id, staff_branch, program, group, year, staff_name)
+                ensure_payment_row(trainee_id, staff_branch, norm(program), norm(group), norm(year), staff_name)
 
-                pay = ensure_cols(read_df("Payments"), "Payments")
-                m = pay[(pay["trainee_id"].astype(str).str.strip() == norm(trainee_id)) &
-                        (pay["year"].astype(str).str.strip() == norm(year))].copy()
-                rowp = m.iloc[0].to_dict()
+                pay = read_df("Payments")
+                for c in ["trainee_id", "year"]:
+                    if c not in pay.columns:
+                        pay[c] = ""
+                m = pay[
+                    (pay["trainee_id"].astype(str).str.strip() == trainee_id) &
+                    (pay["year"].astype(str).str.strip() == norm(year))
+                ].copy()
+                rowp = m.iloc[0].to_dict() if not m.empty else {}
 
-                st.markdown("### 📌 علّم الأشهر اللي خالصين")
                 cols = st.columns(4)
                 for i, mo in enumerate(MONTHS):
                     paid = (norm(rowp.get(mo)).upper() == "TRUE")
                     with cols[i % 4]:
-                        new_paid = st.checkbox(mo, value=paid, key=f"ck_{mo}_{trainee_id}_{year}")
+                        new_paid = st.checkbox(mo, value=paid, key=f"pay_{trainee_id}_{year}_{mo}")
                         if new_paid != paid:
-                            set_payment_month(trainee_id, year, mo, new_paid, staff_name)
+                            set_payment_month(trainee_id, norm(year), mo, new_paid, staff_name)
                             st.rerun()
 
-    # ------------------ Timetable CRUD
-    with tab_tt:
+    # -------- Timetable (Planning CRUD)
+    with tabs[6]:
         if not (program and group):
-            st.info("اختار spécialité + groupe.")
+            st.info("اختار Spécialité + Groupe.")
         else:
-            sub = subjects_df.copy()
-            for c in ["branch", "program", "group", "subject_name", "is_active"]:
-                sub[c] = sub[c].astype(str).str.strip()
-            sub = sub[(sub["branch"] == staff_branch) & (sub["program"] == norm(program)) & (sub["group"] == norm(group))].copy()
-            sub = sub[sub["is_active"].astype(str).str.lower() != "false"].copy()
-            subjects = sorted([x for x in sub["subject_name"].astype(str).str.strip().tolist() if x])
+            st.markdown("### 🗓️ Planning — Ajouter / Modifier / Supprimer")
+            sub = df_filter(read_df("Subjects"), branch=staff_branch, program=program, group=group)
+            if not sub.empty and "is_active" in sub.columns:
+                sub = sub[sub["is_active"].astype(str).str.strip().str.lower() != "false"].copy()
+            subjects = sorted([x for x in sub.get("subject_name", pd.Series([], dtype=str)).astype(str).str.strip().tolist() if x])
 
-            st.markdown("### ➕ Ajouter séance")
-            c1, c2, c3 = st.columns(3)
+            tt = load_timetable(staff_branch, norm(program), norm(group), norm(year))
+            st.markdown("#### Aperçu (pour les stagiaires)")
+            st.markdown(timetable_grid_html(tt), unsafe_allow_html=True)
+
+            st.divider()
+            c1, c2 = st.columns([1, 1])
+
             with c1:
-                day = st.selectbox("Jour", DAYS, key="tt_day_add")
-                start = st.text_input("Heure début (ex: 09:00)", key="tt_start_add")
-                end = st.text_input("Heure fin (ex: 10:30)", key="tt_end_add")
-            with c2:
-                subject = st.selectbox("Matière", subjects if subjects else ["(no subjects)"], key="tt_subject_add")
-                teacher = st.text_input("Nom du prof", key="tt_teacher_add")
+                st.markdown("#### ➕ Ajouter un créneau")
+                day = st.selectbox("Jour", DAYS_FR, key="tt_day_add")
+                start = st.text_input("Heure début (ex: 18:00)", key="tt_start_add")
+                end = st.text_input("Heure fin (ex: 19:30)", key="tt_end_add")
+                teacher = st.text_input("Nom du formateur", key="tt_teacher_add")
                 room = st.text_input("Salle (optionnel)", key="tt_room_add")
-            with c3:
-                col_default = "#E8EEF7"
-                color = st.color_picker("Couleur", value=col_default, key="tt_color_add")
-
-            if st.button("✅ Enregistrer séance", use_container_width=True, key="tt_save_add"):
-                if not norm(start) or not norm(end) or not norm(teacher) or not norm(subject) or subject == "(no subjects)":
-                    st.error("لازم وقت (من/إلى) + مادة + اسم البروف.")
+                color = st.color_picker("Couleur", value="#E8EEF7", key="tt_color_add")
+                note = st.text_input("Note (optionnel)", key="tt_note_add")
+                if subjects:
+                    subject_name = st.selectbox("Matière", subjects, key="tt_subj_add")
                 else:
-                    append_row("Timetable", {
-                        "row_id": f"TT-{uuid.uuid4().hex[:10].upper()}",
-                        "branch": staff_branch,
-                        "program": norm(program),
-                        "group": norm(group),
-                        "year": norm(year),
-                        "day": norm(day),
-                        "start": norm(start),
-                        "end": norm(end),
-                        "subject": norm(subject),
-                        "room": norm(room),
-                        "teacher": norm(teacher),
-                        "color": valid_hex_color(color, "#E8EEF7"),
-                        "created_at": now_str(),
-                        "updated_at": now_str(),
-                        "staff_name": staff_name,
-                    })
-                    st.success("✅ Ajouté")
-                    st.rerun()
+                    subject_name = st.text_input("Matière (ajoute matières d'abord)", key="tt_subj_add_free")
 
-            st.divider()
-            st.markdown("### 🗓️ Preview (الجدول اللي باش يشوفوه الموظف والمتكون)")
-            tt = load_timetable(staff_branch, program, group, year)
-            st.markdown(timetable_html_grid(tt), unsafe_allow_html=True)
+                if st.button("✅ Ajouter", use_container_width=True, key="tt_add_btn"):
+                    if not norm(day) or not norm(start) or not norm(end) or not norm(subject_name):
+                        st.error("Jour + start + end + matière obligatoires.")
+                    else:
+                        add_timetable_row(
+                            staff_branch, norm(program), norm(group), norm(year),
+                            norm(day), norm(start), norm(end),
+                            norm(subject_name), norm(teacher), norm(room),
+                            norm(color), norm(note), staff_name
+                        )
+                        st.success("✅ Créneau ajouté.")
+                        st.rerun()
 
-            st.divider()
-            st.markdown("### ✏️/🗑️ تعديل أو حذف سِيانس")
-            if tt.empty:
-                st.info("لا توجد حصص.")
-            else:
-                tt2 = tt.copy()
-                for c in ["day", "start", "end", "subject", "teacher", "room", "row_id", "color"]:
-                    tt2[c] = tt2[c].astype(str).str.strip()
-                day_map = {d: i for i, d in enumerate(DAYS)}
-                tt2["day_i"] = tt2["day"].map(lambda x: day_map.get(x, 99))
-                tt2 = tt2.sort_values(by=["day_i", "start", "end"], ascending=True)
+            with c2:
+                st.markdown("#### ✏️ Modifier / 🗑️ Supprimer")
+                if tt.empty:
+                    st.info("Aucun créneau.")
+                else:
+                    # build selection list
+                    tt2 = tt.copy()
+                    for c in ["row_id", "day", "start", "end", "subject_name", "teacher"]:
+                        if c not in tt2.columns:
+                            tt2[c] = ""
+                    tt2["label"] = (
+                        tt2["day"].astype(str) + " | " +
+                        tt2["start"].astype(str) + "-" + tt2["end"].astype(str) + " | " +
+                        tt2["subject_name"].astype(str) + " | " +
+                        tt2["teacher"].astype(str) + " | " +
+                        tt2["row_id"].astype(str)
+                    )
+                    pick = st.selectbox("Choisir un créneau", tt2["label"].tolist(), key="tt_pick")
+                    row = tt2[tt2["label"] == pick].iloc[0].to_dict()
+                    row_id = norm(row.get("row_id"))
 
-                tt2["label"] = (
-                    tt2["day"] + " | " +
-                    tt2["start"] + "-" + tt2["end"] + " | " +
-                    tt2["subject"] + " | " +
-                    tt2["teacher"] + " | " +
-                    tt2["row_id"]
-                )
-                pick = st.selectbox("Choisir séance", tt2["label"].tolist(), key="tt_pick_edit")
-                row = tt2[tt2["label"] == pick].iloc[0].to_dict()
-                rid = norm(row.get("row_id"))
-
-                e1, e2, e3 = st.columns(3)
-                with e1:
-                    day_e = st.selectbox("Jour", DAYS, index=max(0, DAYS.index(norm(row.get("day"))) if norm(row.get("day")) in DAYS else 0),
-                                         key="tt_day_edit")
+                    day_e = st.selectbox("Jour", DAYS_FR, index=DAYS_FR.index(norm(row.get("day"))) if norm(row.get("day")) in DAYS_FR else 0, key="tt_day_edit")
                     start_e = st.text_input("Heure début", value=norm(row.get("start")), key="tt_start_edit")
                     end_e = st.text_input("Heure fin", value=norm(row.get("end")), key="tt_end_edit")
-                with e2:
-                    subj_list = subjects if subjects else [norm(row.get("subject")) or "—"]
-                    idx_sub = subj_list.index(norm(row.get("subject"))) if norm(row.get("subject")) in subj_list else 0
-                    subject_e = st.selectbox("Matière", subj_list, index=idx_sub, key="tt_subject_edit")
-                    teacher_e = st.text_input("Nom du prof", value=norm(row.get("teacher")), key="tt_teacher_edit")
+                    teacher_e = st.text_input("Formateur", value=norm(row.get("teacher")), key="tt_teacher_edit")
                     room_e = st.text_input("Salle", value=norm(row.get("room")), key="tt_room_edit")
-                with e3:
-                    color_seed = valid_hex_color(row.get("color"), "#E8EEF7")
-                    color_e = st.color_picker("Couleur", value=color_seed, key="tt_color_edit")
+                    color_e = st.color_picker("Couleur", value=norm(row.get("color")) or "#E8EEF7", key="tt_color_edit")
+                    note_e = st.text_input("Note", value=norm(row.get("note")), key="tt_note_edit")
 
-                b1, b2 = st.columns(2)
-                with b1:
-                    if st.button("💾 Sauvegarder modification", use_container_width=True, key="tt_save_edit"):
-                        ok = update_row_by_key(
-                            "Timetable",
-                            ["row_id"], [rid],
-                            {
+                    if subjects and norm(row.get("subject_name")) in subjects:
+                        subj_e = st.selectbox("Matière", subjects, index=subjects.index(norm(row.get("subject_name"))), key="tt_subj_edit")
+                    elif subjects:
+                        subj_e = st.selectbox("Matière", subjects, key="tt_subj_edit_fallback")
+                    else:
+                        subj_e = st.text_input("Matière", value=norm(row.get("subject_name")), key="tt_subj_edit_free")
+
+                    colx, coly = st.columns(2)
+                    with colx:
+                        if st.button("💾 Enregistrer modifications", use_container_width=True, key="tt_save_edit"):
+                            ok = update_timetable_row(row_id, {
                                 "day": norm(day_e),
                                 "start": norm(start_e),
                                 "end": norm(end_e),
-                                "subject": norm(subject_e),
+                                "subject_name": norm(subj_e),
                                 "teacher": norm(teacher_e),
                                 "room": norm(room_e),
-                                "color": valid_hex_color(color_e, "#E8EEF7"),
-                                "updated_at": now_str(),
+                                "color": norm(color_e),
+                                "note": norm(note_e),
                                 "staff_name": staff_name,
-                            }
-                        )
-                        if ok:
-                            st.success("✅ تم التعديل")
-                            st.rerun()
-                        else:
-                            st.error("❌ ما لقايناش السطر باش نعدلو")
-                with b2:
-                    if st.button("🗑️ Supprimer séance", use_container_width=True, key="tt_del"):
-                        if delete_row_by_key("Timetable", "row_id", rid):
-                            st.success("✅ تحذفت")
-                            st.rerun()
-                        else:
-                            st.error("❌ ما تحذفتش")
+                            })
+                            if ok:
+                                st.success("✅ Modifié.")
+                                st.rerun()
+                            else:
+                                st.error("❌ Échec modification (row_id introuvable).")
 
-    # ------------------ Supports (Drive links manual)
-    with tab_sup:
+                    with coly:
+                        if st.button("🗑️ Supprimer", use_container_width=True, key="tt_delete"):
+                            ok = delete_timetable_row(row_id)
+                            if ok:
+                                st.success("✅ Supprimé.")
+                                st.rerun()
+                            else:
+                                st.error("❌ Échec suppression (row_id introuvable).")
+
+    # -------- Course links (Supports CRUD)
+    with tabs[7]:
         if not (program and group):
-            st.info("اختار spécialité + groupe.")
+            st.info("اختار Spécialité + Groupe.")
         else:
-            sub = subjects_df.copy()
-            for c in ["branch", "program", "group", "subject_name", "is_active"]:
-                sub[c] = sub[c].astype(str).str.strip()
-            sub = sub[(sub["branch"] == staff_branch) & (sub["program"] == norm(program)) & (sub["group"] == norm(group))].copy()
-            sub = sub[sub["is_active"].astype(str).str.lower() != "false"].copy()
-            subjects = sorted([x for x in sub["subject_name"].astype(str).str.strip().tolist() if x])
+            st.markdown("### 📎 Supports de cours (liens Google Drive)")
+
+            sub = df_filter(read_df("Subjects"), branch=staff_branch, program=program, group=group)
+            if not sub.empty and "is_active" in sub.columns:
+                sub = sub[sub["is_active"].astype(str).str.strip().str.lower() != "false"].copy()
+            subjects = sorted([x for x in sub.get("subject_name", pd.Series([], dtype=str)).astype(str).str.strip().tolist() if x])
 
             if not subjects:
-                st.warning("زيد matières قبل (Sheet Subjects).")
-            else:
-                st.markdown("### ➕ Ajouter fichier (Lien Google Drive)")
-                subj = st.selectbox("Matière", subjects, key="cf_subject")
-                fname = st.text_input("Nom du fichier", key="cf_name")
-                link = st.text_input("Lien Google Drive (Share link: Anyone with the link)", key="cf_link")
+                st.warning("زيد matières قبل.")
+                return
 
-                if st.button("✅ Enregistrer fichier", use_container_width=True, key="cf_save"):
-                    if not norm(link) or not norm(fname):
-                        st.error("لازم اسم ملف + رابط.")
+            subj = st.selectbox("Matière", subjects, key="cl_subj")
+            title = st.text_input("Titre (ex: Cours 1, PDF, Exercice...)", key="cl_title")
+            share_link = st.text_input("Lien Google Drive (Share: Anyone with the link)", key="cl_link")
+
+            cadd, cdel = st.columns([1, 1])
+            with cadd:
+                if st.button("✅ Enregistrer", use_container_width=True, key="cl_save"):
+                    if not norm(title) or not norm(share_link):
+                        st.error("Titre + lien obligatoires.")
                     else:
-                        view_url, dl_url = to_view_and_download(link)
-                        append_row("CourseFiles", {
-                            "file_id": f"CF-{uuid.uuid4().hex[:8].upper()}",
+                        view_url, dl_url = to_view_and_download(share_link)
+                        append_row("CourseLinks", {
+                            "link_id": f"CL-{uuid.uuid4().hex[:8].upper()}",
                             "branch": staff_branch,
                             "program": norm(program),
                             "group": norm(group),
                             "subject_name": norm(subj),
-                            "file_name": norm(fname),
+                            "title": norm(title),
+                            "drive_share_url": norm(share_link),
                             "drive_view_url": view_url,
                             "drive_download_url": dl_url,
                             "uploaded_at": now_str(),
                             "staff_name": staff_name,
                         })
-                        st.success("✅ Fichier enregistré.")
+                        st.success("✅ Support enregistré.")
                         st.rerun()
 
-            files = ensure_cols(read_df("CourseFiles"), "CourseFiles")
-            files = files[(files["branch"].astype(str).str.strip() == staff_branch) &
-                          (files["program"].astype(str).str.strip() == norm(program)) &
-                          (files["group"].astype(str).str.strip() == norm(group))] if not files.empty else pd.DataFrame()
-            if not files.empty:
-                st.divider()
-                st.markdown("### 🗂️ Fichiers enregistrés (اللي باش يشوفهم المتكون)")
+            st.divider()
+            files = read_df("CourseLinks")
+            for c in ["branch", "program", "group"]:
+                if c not in files.columns:
+                    files[c] = ""
+            files = files[
+                (files["branch"].astype(str).str.strip() == staff_branch) &
+                (files["program"].astype(str).str.strip() == norm(program)) &
+                (files["group"].astype(str).str.strip() == norm(group))
+            ].copy()
+
+            if files.empty:
+                st.info("Aucun support enregistré.")
+            else:
+                for c in ["uploaded_at"]:
+                    if c not in files.columns:
+                        files[c] = ""
                 files = files.sort_values(by=["uploaded_at"], ascending=False)
-                for _, r in files.iterrows():
-                    fid = norm(r.get("file_id")) or uuid.uuid4().hex
-                    st.markdown(f"**📌 {norm(r.get('subject_name'))}** — {norm(r.get('file_name'))}")
-                    link_btn("👀 Ouvrir", norm(r.get("drive_view_url")), key=f"stf_v_{fid}")
-                    link_btn("⬇️ Télécharger", norm(r.get("drive_download_url")), key=f"stf_d_{fid}")
-                    # delete
-                    if st.button("🗑️ Supprimer ce fichier", use_container_width=True, key=f"cf_del_{fid}"):
-                        if delete_row_by_key("CourseFiles", "file_id", norm(r.get("file_id"))):
-                            st.success("✅ تحذف")
+
+                # delete UI
+                files["label"] = files.get("subject_name", "").astype(str) + " — " + files.get("title", "").astype(str) + " — " + files.get("link_id", "").astype(str)
+                pick = st.selectbox("Choisir un support (pour supprimer)", files["label"].tolist(), key="cl_pick_del")
+                link_id = norm(files[files["label"] == pick].iloc[0].get("link_id"))
+                with cdel:
+                    if st.button("🗑️ Supprimer ce support", use_container_width=True, key="cl_del"):
+                        ok = delete_row_by_key("CourseLinks", ["link_id"], [link_id])
+                        if ok:
+                            st.success("✅ Supprimé.")
                             st.rerun()
                         else:
-                            st.error("❌ ما تحذفش")
-                    st.divider()
+                            st.error("❌ Introuvable.")
 
-    # ------------------ Moyennes CRUD
-    with tab_avg:
-        if not (program and group):
-            st.info("اختار spécialité + groupe.")
-        else:
-            tr = trainees_df.copy()
-            for c in ["branch", "program", "group", "phone", "full_name", "trainee_id"]:
-                tr[c] = tr[c].astype(str).str.strip()
-            tr = tr[(tr["branch"] == staff_branch) & (tr["program"] == norm(program)) & (tr["group"] == norm(group))].copy()
-            if tr.empty:
-                st.info("لا يوجد stagiaires.")
-            else:
-                tr["label"] = tr["full_name"] + " — " + tr["phone"] + " — " + tr["trainee_id"]
-                chosen = st.selectbox("Choisir stagiaire", tr["label"].tolist(), key="avg_trainee")
-                trainee_id = tr[tr["label"] == chosen].iloc[0]["trainee_id"]
-
-                st.markdown("### ➕ Ajouter moyenne")
-                sem = st.selectbox("Semestre", ["S1", "S2", "S3", "S4"], key="avg_sem_add")
-                avg_val = st.number_input("Moyenne", min_value=0.0, max_value=20.0, value=10.0, step=0.01, key="avg_val_add")
-                note = st.text_area("Remarque (optionnel)", key="avg_note_add")
-
-                if st.button("✅ Enregistrer moyenne", use_container_width=True, key="avg_save_add"):
-                    append_row("Averages", {
-                        "avg_id": f"AV-{uuid.uuid4().hex[:8].upper()}",
-                        "trainee_id": trainee_id,
-                        "branch": staff_branch,
-                        "program": norm(program),
-                        "group": norm(group),
-                        "year": norm(year),
-                        "semester": norm(sem),
-                        "average": str(avg_val),
-                        "note": norm(note),
-                        "created_at": now_str(),
-                        "updated_at": now_str(),
-                        "staff_name": staff_name,
-                    })
-                    st.success("✅ Ajouté")
-                    st.rerun()
-
-                st.divider()
-                st.markdown("### ✏️/🗑️ تعديل أو حذف Moyennes")
-                av = load_averages(staff_branch, program, group, trainee_id=trainee_id)
-                if av.empty:
-                    st.info("لا توجد Moyennes.")
-                else:
-                    av2 = av.copy()
-                    for c in ["year", "semester", "average", "avg_id"]:
-                        av2[c] = av2[c].astype(str).str.strip()
-                    av2 = av2.sort_values(by=["year", "semester"], ascending=False)
-                    av2["label"] = av2["year"] + " | " + av2["semester"] + " | " + av2["average"] + " | " + av2["avg_id"]
-                    pick = st.selectbox("Choisir moyenne", av2["label"].tolist(), key="avg_pick")
-                    row = av2[av2["label"] == pick].iloc[0].to_dict()
-                    aid = norm(row.get("avg_id"))
-
-                    e1, e2 = st.columns(2)
-                    with e1:
-                        year_e = st.text_input("Année", value=norm(row.get("year")), key="avg_year_edit")
-                        sem_e = st.selectbox("Semestre", ["S1", "S2", "S3", "S4"],
-                                             index=max(0, ["S1","S2","S3","S4"].index(norm(row.get("semester"))) if norm(row.get("semester")) in ["S1","S2","S3","S4"] else 0),
-                                             key="avg_sem_edit")
-                        avg_e = st.number_input("Moyenne", min_value=0.0, max_value=20.0,
-                                                value=float(safe_float(row.get("average"), 0.0)),
-                                                step=0.01, key="avg_val_edit")
-                    with e2:
-                        note_e = st.text_area("Remarque", value=norm(row.get("note")), key="avg_note_edit")
-
-                    b1, b2 = st.columns(2)
-                    with b1:
-                        if st.button("💾 Sauvegarder modification", use_container_width=True, key="avg_save_edit"):
-                            ok = update_row_by_key(
-                                "Averages",
-                                ["avg_id"], [aid],
-                                {
-                                    "year": norm(year_e),
-                                    "semester": norm(sem_e),
-                                    "average": str(avg_e),
-                                    "note": norm(note_e),
-                                    "updated_at": now_str(),
-                                    "staff_name": staff_name,
-                                }
-                            )
-                            if ok:
-                                st.success("✅ تم التعديل")
-                                st.rerun()
-                            else:
-                                st.error("❌ ما لقايناش السطر")
-                    with b2:
-                        if st.button("🗑️ Supprimer moyenne", use_container_width=True, key="avg_del"):
-                            if delete_row_by_key("Averages", "avg_id", aid):
-                                st.success("✅ تحذفت")
-                                st.rerun()
-                            else:
-                                st.error("❌ ما تحذفتش")
+                st.markdown("#### Liste des supports")
+                st.dataframe(files[[c for c in ["subject_name", "title", "uploaded_at", "staff_name"] if c in files.columns]],
+                             use_container_width=True, hide_index=True)
 
 # =========================================================
 # MAIN
@@ -1335,6 +1316,7 @@ def main():
     ensure_schema_once()
     sidebar_staff_login()
 
+    # staff sees both: staff tools + student portal (for testing)
     if st.session_state.role == "staff":
         staff_work_center()
         st.divider()
@@ -1346,3 +1328,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
