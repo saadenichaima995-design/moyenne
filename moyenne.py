@@ -6,6 +6,7 @@
 # ✅ Supports de cours = روابط Google Drive (manual paste) + المتكون يلقى الدروس ويحملها
 # ✅ Import Excel stagiaires (full_name + phone)
 # ✅ CRUD: الموظف ينجم يزيد/يعدّل/يفسخ (Planning + Supports + Stagiaires + Notes + Paiements)
+# ✅ Notes: الموظف ينجم يعدّل/يفسخ النوط اللي زادهم + جدول "Mes notes" حسب الاختصاص
 # ✅ بدون Drive API (تفادياً لمشاكل Service Account quota/permissions)
 # ✅ بدون st.link_button (باش ما يطيحش حسب نسخة Streamlit)
 
@@ -13,7 +14,7 @@ import uuid
 import base64
 import io
 import re
-from datetime import datetime, date as date_cls
+from datetime import datetime
 
 import streamlit.components.v1 as components
 import pandas as pd
@@ -119,7 +120,7 @@ def compress_image_bytes(img_bytes: bytes, max_side: int = 256, quality: int = 7
     return out.getvalue()
 
 # ---- Drive link helpers (manual links) ----
-def extract_drive_file_id(url: str) -> str | None:
+def extract_drive_file_id(url: str):
     u = norm(url)
     if not u:
         return None
@@ -143,7 +144,7 @@ def extract_drive_file_id(url: str) -> str | None:
         return m.group(1)
     return None
 
-def to_view_and_download(share_url: str) -> tuple[str, str]:
+def to_view_and_download(share_url: str):
     fid = extract_drive_file_id(share_url)
     if not fid:
         return norm(share_url), norm(share_url)
@@ -244,7 +245,7 @@ def append_row(ws_name: str, row: dict):
     ws.append_row(out, value_input_option="USER_ENTERED")
     st.cache_data.clear()
 
-def find_first_rownum_by_key(ws_name: str, key_cols: list[str], key_vals: list[str]) -> int | None:
+def find_first_rownum_by_key(ws_name: str, key_cols: list[str], key_vals: list[str]):
     df = read_df(ws_name)
     if df.empty:
         return None
@@ -283,7 +284,7 @@ def delete_row_by_key(ws_name: str, key_cols: list[str], key_vals: list[str]) ->
 # =========================================================
 # PROFILE PICS
 # =========================================================
-def get_profile_pic_bytes(phone: str) -> bytes | None:
+def get_profile_pic_bytes(phone: str):
     df = read_df("ProfilePics")
     if df.empty:
         return None
@@ -374,7 +375,6 @@ def load_timetable(branch: str, program: str, group: str, year: str) -> pd.DataF
         return df
     df2 = df.copy()
 
-    # ensure columns exist
     for c in REQUIRED_SHEETS["Timetable"]:
         if c not in df2.columns:
             df2[c] = ""
@@ -387,7 +387,6 @@ def load_timetable(branch: str, program: str, group: str, year: str) -> pd.DataF
     )
     df2 = df2[m].copy()
 
-    # ordering
     df2["day_i"] = df2["day"].astype(str).map(lambda d: DAY_ORDER.get(norm(d), 99))
     df2["start_sort"] = df2["start"].astype(str)
     df2["end_sort"] = df2["end"].astype(str)
@@ -425,12 +424,9 @@ def delete_timetable_row(row_id: str) -> bool:
     return delete_row_by_key("Timetable", ["row_id"], [row_id])
 
 def timetable_grid_html(df: pd.DataFrame) -> str:
-    # Build a simple HTML table with colored cells
-    # Columns: Days rows; time slots per day (stacked)
     if df is None or df.empty:
         return "<div style='padding:10px;border:1px dashed #999;border-radius:10px'>Aucun créneau enregistré.</div>"
 
-    # group by day
     by_day = {d: [] for d in DAYS_FR}
     for _, r in df.iterrows():
         day = norm(r.get("day"))
@@ -438,7 +434,6 @@ def timetable_grid_html(df: pd.DataFrame) -> str:
             continue
         by_day[day].append(r.to_dict())
 
-    # Build table
     html = """
     <style>
       .tt-wrap{width:100%; overflow-x:auto;}
@@ -490,6 +485,15 @@ def timetable_grid_html(df: pd.DataFrame) -> str:
         html += "</td>"
     html += "</tr></tbody></table></div>"
     return html
+
+# =========================================================
+# GRADES CRUD (EDIT/DELETE)
+# =========================================================
+def update_grade_row(grade_id: str, updates: dict) -> bool:
+    return update_row_by_key("Grades", ["grade_id"], [grade_id], updates)
+
+def delete_grade_row(grade_id: str) -> bool:
+    return delete_row_by_key("Grades", ["grade_id"], [grade_id])
 
 # =========================================================
 # AUTH / SESSION
@@ -667,7 +671,6 @@ def student_portal_center():
             for c in ["branch", "program", "group", "phone"]:
                 tr2[c] = tr2[c].astype(str).str.strip()
 
-            # ✅ match by phone ONLY (with same centre/program/group)
             candidates = tr2[
                 (tr2["branch"] == norm(b)) &
                 (tr2["program"] == norm(p)) &
@@ -752,7 +755,6 @@ def student_portal_center():
             if grf.empty:
                 st.info("Aucune note pour le moment.")
             else:
-                # safe sort
                 for c in ["date", "created_at"]:
                     if c not in grf.columns:
                         grf[c] = ""
@@ -762,12 +764,10 @@ def student_portal_center():
 
         with t2:
             y_default = today_year_str()
-            # allow student to choose year for timetable
             tt_all = read_df("Timetable")
             if tt_all.empty:
                 st.info("Aucun planning enregistré.")
             else:
-                # list years for this group
                 for c in ["branch", "program", "group", "year"]:
                     if c not in tt_all.columns:
                         tt_all[c] = ""
@@ -820,12 +820,11 @@ def student_portal_center():
                 if files.empty:
                     st.info("لا توجد دروس لهذه المجموعة.")
                 else:
-                    for c in ["uploaded_at"]:
-                        if c not in files.columns:
-                            files[c] = ""
+                    if "uploaded_at" not in files.columns:
+                        files["uploaded_at"] = ""
                     files = files.sort_values(by=["uploaded_at"], ascending=False)
                     for _, r in files.iterrows():
-                        title = norm(r.get("title")) or norm(r.get("file_name")) or "Support"
+                        title = norm(r.get("title")) or "Support"
                         subj = norm(r.get("subject_name"))
                         view_url = norm(r.get("drive_view_url"))
                         dl_url = norm(r.get("drive_download_url"))
@@ -859,7 +858,6 @@ def staff_work_center():
     staff_name = f"Staff-{staff_branch}"
     st.success(f"Centre: {staff_branch}")
 
-    # programs/groups
     prog_df = df_filter(read_df("Programs"), branch=staff_branch)
     if not prog_df.empty and "is_active" in prog_df.columns:
         prog_df = prog_df[prog_df["is_active"].astype(str).str.strip().str.lower() != "false"].copy()
@@ -974,7 +972,6 @@ def staff_work_center():
                 if not norm(name) or not norm(phone):
                     st.error("Nom + téléphone obligatoires.")
                 else:
-                    # avoid duplicate phone in same group
                     existing = df_filter(read_df("Trainees"), branch=staff_branch, program=program, group=group)
                     if not existing.empty and "phone" in existing.columns:
                         if existing["phone"].astype(str).str.strip().eq(norm(phone)).any():
@@ -1030,7 +1027,7 @@ def staff_work_center():
                         st.success(f"✅ Import terminé: {count}")
                         st.rerun()
 
-    # -------- Grades
+    # -------- Grades (ADD + LIST MY GRADES + EDIT/DELETE)
     with tabs[4]:
         if not (program and group):
             st.info("اختار Spécialité + Groupe.")
@@ -1042,44 +1039,146 @@ def staff_work_center():
 
             if tr.empty:
                 st.warning("لا يوجد stagiaires.")
-            elif sub.empty:
+                return
+            if sub.empty:
                 st.warning("زيد matières قبل.")
-            else:
-                tr = tr.copy()
-                for c in ["full_name", "phone", "trainee_id"]:
-                    if c not in tr.columns:
-                        tr[c] = ""
-                tr["label"] = tr["full_name"].astype(str) + " — " + tr["phone"].astype(str) + " — " + tr["trainee_id"].astype(str)
-                chosen = st.selectbox("Stagiaire", tr["label"].tolist(), key="gr_tr_sel")
-                trainee_id = norm(tr[tr["label"] == chosen].iloc[0]["trainee_id"])
+                return
 
-                subjects = sorted([x for x in sub.get("subject_name", pd.Series([], dtype=str)).astype(str).str.strip().tolist() if x])
-                subject_name = st.selectbox("Matière", subjects, key="gr_sub_sel")
-                exam_type = st.text_input("Type examen (DS1/TP/Examen...)", key="gr_exam")
-                score = st.number_input("Note", min_value=0.0, max_value=20.0, value=10.0, step=0.25, key="gr_score")
-                d = st.date_input("Date", value=datetime.now().date(), key="gr_date")
-                note = st.text_area("Remarque", key="gr_note")
+            st.markdown("### ➕ Ajouter une note")
 
-                if st.button("✅ Enregistrer la note", use_container_width=True, key="gr_save_btn"):
-                    if not norm(exam_type):
-                        st.error("Type examen obligatoire.")
-                    else:
-                        append_row("Grades", {
-                            "grade_id": f"GR-{uuid.uuid4().hex[:8].upper()}",
-                            "trainee_id": trainee_id,
-                            "branch": staff_branch,
-                            "program": norm(program),
-                            "group": norm(group),
-                            "subject_name": norm(subject_name),
-                            "exam_type": norm(exam_type),
-                            "score": str(score),
-                            "date": str(d),
-                            "staff_name": staff_name,
-                            "note": norm(note),
-                            "created_at": now_str(),
-                        })
-                        st.success("✅ Note enregistrée.")
+            tr = tr.copy()
+            for c in ["full_name", "phone", "trainee_id"]:
+                if c not in tr.columns:
+                    tr[c] = ""
+            tr["label"] = tr["full_name"].astype(str) + " — " + tr["phone"].astype(str) + " — " + tr["trainee_id"].astype(str)
+            chosen = st.selectbox("Stagiaire", tr["label"].tolist(), key="gr_tr_sel")
+            trainee_id = norm(tr[tr["label"] == chosen].iloc[0]["trainee_id"])
+
+            subjects = sorted([x for x in sub.get("subject_name", pd.Series([], dtype=str)).astype(str).str.strip().tolist() if x])
+            subject_name = st.selectbox("Matière", subjects, key="gr_sub_sel")
+            exam_type = st.text_input("Type examen (DS1/TP/Examen...)", key="gr_exam")
+            score = st.number_input("Note", min_value=0.0, max_value=20.0, value=10.0, step=0.25, key="gr_score")
+            d = st.date_input("Date", value=datetime.now().date(), key="gr_date")
+            note = st.text_area("Remarque", key="gr_note")
+
+            if st.button("✅ Enregistrer la note", use_container_width=True, key="gr_save_btn"):
+                if not norm(exam_type):
+                    st.error("Type examen obligatoire.")
+                else:
+                    append_row("Grades", {
+                        "grade_id": f"GR-{uuid.uuid4().hex[:8].upper()}",
+                        "trainee_id": trainee_id,
+                        "branch": staff_branch,
+                        "program": norm(program),
+                        "group": norm(group),
+                        "subject_name": norm(subject_name),
+                        "exam_type": norm(exam_type),
+                        "score": str(score),
+                        "date": str(d),
+                        "staff_name": staff_name,
+                        "note": norm(note),
+                        "created_at": now_str(),
+                    })
+                    st.success("✅ Note enregistrée.")
+                    st.rerun()
+
+            st.divider()
+            st.markdown("### 📋 Mes notes (حسب الاختصاص) — تعديل / حذف")
+
+            gr = read_df("Grades")
+            if gr.empty:
+                st.info("Aucune note.")
+                return
+
+            for c in ["grade_id", "branch", "program", "group", "staff_name", "trainee_id",
+                      "subject_name", "exam_type", "score", "date", "note", "created_at"]:
+                if c not in gr.columns:
+                    gr[c] = ""
+
+            grf = gr[
+                (gr["branch"].astype(str).str.strip() == staff_branch) &
+                (gr["program"].astype(str).str.strip() == norm(program)) &
+                (gr["group"].astype(str).str.strip() == norm(group)) &
+                (gr["staff_name"].astype(str).str.strip() == norm(staff_name))
+            ].copy()
+
+            if grf.empty:
+                st.info("ما عندك حتى note مسجلة لهالاختصاص/المجموعة.")
+                return
+
+            tr_map = {}
+            tr_tmp = tr.copy()
+            tr_tmp["trainee_id"] = tr_tmp["trainee_id"].astype(str).str.strip()
+            tr_tmp["full_name"] = tr_tmp["full_name"].astype(str).str.strip()
+            tr_map = dict(zip(tr_tmp["trainee_id"], tr_tmp["full_name"]))
+
+            grf["trainee_name"] = grf["trainee_id"].astype(str).map(lambda x: tr_map.get(norm(x), ""))
+
+            grf["date_sort"] = grf["date"].astype(str)
+            grf["created_sort"] = grf["created_at"].astype(str)
+            grf = grf.sort_values(by=["date_sort", "created_sort"], ascending=False)
+
+            show_cols = [c for c in ["trainee_name", "subject_name", "exam_type", "score", "date", "note", "grade_id"] if c in grf.columns]
+            st.dataframe(grf[show_cols], use_container_width=True, hide_index=True)
+
+            st.divider()
+
+            grf["label"] = (
+                grf["trainee_name"].astype(str) + " | " +
+                grf["subject_name"].astype(str) + " | " +
+                grf["exam_type"].astype(str) + " | " +
+                grf["score"].astype(str) + " | " +
+                grf["date"].astype(str) + " | " +
+                grf["grade_id"].astype(str)
+            )
+
+            pick = st.selectbox("اختر note للتعديل/الحذف", grf["label"].tolist(), key="gr_pick_edit")
+            row = grf[grf["label"] == pick].iloc[0].to_dict()
+            grade_id = norm(row.get("grade_id"))
+
+            col1, col2 = st.columns(2)
+            with col1:
+                subject_e = st.text_input("Matière", value=norm(row.get("subject_name")), key="gr_subject_edit")
+                exam_e = st.text_input("Type examen", value=norm(row.get("exam_type")), key="gr_exam_edit")
+                try:
+                    score_default = float(norm(row.get("score")) or 0)
+                except Exception:
+                    score_default = 0.0
+                score_e = st.number_input("Note", min_value=0.0, max_value=20.0, value=score_default, step=0.25, key="gr_score_edit")
+
+            with col2:
+                try:
+                    d0 = datetime.fromisoformat(norm(row.get("date"))).date()
+                except Exception:
+                    d0 = datetime.now().date()
+                date_e = st.date_input("Date", value=d0, key="gr_date_edit")
+                note_e = st.text_area("Remarque", value=norm(row.get("note")), key="gr_note_edit")
+
+            csave, cdel = st.columns(2)
+            with csave:
+                if st.button("💾 Enregistrer modification", use_container_width=True, key="gr_update_btn"):
+                    ok = update_grade_row(grade_id, {
+                        "subject_name": norm(subject_e),
+                        "exam_type": norm(exam_e),
+                        "score": str(score_e),
+                        "date": str(date_e),
+                        "note": norm(note_e),
+                        "staff_name": staff_name,
+                    })
+                    if ok:
+                        st.success("✅ Note modifiée.")
                         st.rerun()
+                    else:
+                        st.error("❌ Échec (grade_id introuvable).")
+
+            with cdel:
+                if st.button("🗑️ Supprimer note", use_container_width=True, key="gr_delete_btn"):
+                    ok = delete_grade_row(grade_id)
+                    if ok:
+                        st.success("✅ Note supprimée.")
+                        st.rerun()
+                    else:
+                        st.error("❌ Échec suppression (grade_id introuvable).")
 
     # -------- Payments
     with tabs[5]:
@@ -1169,7 +1268,6 @@ def staff_work_center():
                 if tt.empty:
                     st.info("Aucun créneau.")
                 else:
-                    # build selection list
                     tt2 = tt.copy()
                     for c in ["row_id", "day", "start", "end", "subject_name", "teacher"]:
                         if c not in tt2.columns:
@@ -1286,12 +1384,10 @@ def staff_work_center():
             if files.empty:
                 st.info("Aucun support enregistré.")
             else:
-                for c in ["uploaded_at"]:
-                    if c not in files.columns:
-                        files[c] = ""
+                if "uploaded_at" not in files.columns:
+                    files["uploaded_at"] = ""
                 files = files.sort_values(by=["uploaded_at"], ascending=False)
 
-                # delete UI
                 files["label"] = files.get("subject_name", "").astype(str) + " — " + files.get("title", "").astype(str) + " — " + files.get("link_id", "").astype(str)
                 pick = st.selectbox("Choisir un support (pour supprimer)", files["label"].tolist(), key="cl_pick_del")
                 link_id = norm(files[files["label"] == pick].iloc[0].get("link_id"))
@@ -1316,7 +1412,6 @@ def main():
     ensure_schema_once()
     sidebar_staff_login()
 
-    # staff sees both: staff tools + student portal (for testing)
     if st.session_state.role == "staff":
         staff_work_center()
         st.divider()
@@ -1328,6 +1423,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
